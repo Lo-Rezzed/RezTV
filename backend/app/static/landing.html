@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Loading...</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f0f0f;
+      color: #fff;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      padding: 50px 20px 30px;
+      text-align: center;
+      border-bottom: 1px solid #222;
+    }
+    header h1 {
+      font-size: 2.8rem;
+      font-weight: 700;
+      letter-spacing: -1px;
+    }
+    main {
+      flex: 1;
+      max-width: 800px;
+      width: 100%;
+      margin: 40px auto;
+      padding: 0 20px;
+    }
+    h2 {
+      font-size: 1.3rem;
+      margin-bottom: 20px;
+      color: #ccc;
+    }
+    .channel-list {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .channel {
+      background: #1a1a1a;
+      border: 1px solid #2a2a2a;
+      border-radius: 10px;
+      padding: 18px 22px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      transition: background 0.2s;
+      text-decoration: none;
+      color: white;
+    }
+    .channel:hover {
+      background: #252525;
+      border-color: #444;
+    }
+    .channel-name {
+      font-size: 1.2rem;
+      font-weight: 600;
+    }
+    .channel-id {
+      color: #666;
+      font-size: 0.9rem;
+    }
+    .watch-btn {
+      background: #e10600;
+      color: white;
+      padding: 8px 16px;
+      border-radius: 6px;
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+    footer {
+      text-align: center;
+      padding: 30px;
+      color: #555;
+      font-size: 0.9rem;
+      border-top: 1px solid #222;
+    }
+    .empty {
+      color: #666;
+      text-align: center;
+      padding: 40px 0;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1 id="station-title">Loading...</h1>
+  </header>
+
+  <main>
+    <h2>Channels</h2>
+    <div id="channel-list" class="channel-list">
+      <div class="empty">Loading channels...</div>
+    </div>
+  </main>
+
+  <footer>
+    Powered by RezTV
+  </footer>
+
+  <script>
+    async function loadPage() {
+      // Load station name
+      try {
+        const settingsRes = await fetch("/settings");
+        const settings = await settingsRes.json();
+        const stationName = settings.station_name || "RezTV";
+        document.getElementById("station-title").innerText = stationName;
+        document.title = stationName;
+      } catch (err) {
+        document.getElementById("station-title").innerText = "RezTV";
+      }
+
+      // Load channels
+      try {
+        const res = await fetch("/playlists");
+        const playlists = await res.json();
+        const container = document.getElementById("channel-list");
+
+        if (!playlists || playlists.length === 0) {
+          container.innerHTML = `<div class="empty">No channels available yet</div>`;
+          return;
+        }
+
+        container.innerHTML = playlists.map(p => `
+          <a href="/channel/${p.id}" class="channel">
+            <div>
+              <div class="channel-name">${p.name}</div>
+              <div class="channel-id">Channel ${p.id}</div>
+            </div>
+            <div class="watch-btn">Watch</div>
+          </a>
+        `).join("");
+      } catch (err) {
+        document.getElementById("channel-list").innerHTML = 
+          `<div class="empty">Unable to load channels</div>`;
+      }
+    }
+
+    loadPage();
+  </script>
+</body>
+</html>

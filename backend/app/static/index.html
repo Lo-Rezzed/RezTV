@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>RezTV - Admin</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 1100px; margin: 40px auto; padding: 20px; background: #f5f5f5; }
+    h1 { margin-bottom: 5px; }
+    section { background: white; margin-bottom: 30px; padding: 20px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+    button { padding: 7px 12px; margin: 3px; cursor: pointer; border-radius: 5px; border: 1px solid #bbb; background: #eee; }
+    button:hover { background: #ddd; }
+    input[type=text], input[type=file], select { padding: 7px; margin: 4px 0; }
+    ul { list-style: none; padding: 0; }
+    li { padding: 10px 0; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+    .success { color: green; }
+    .error { color: crimson; }
+    .playlist-box { background: #fafafa; padding: 15px; margin-bottom: 15px; border-radius: 8px; border: 1px solid #eee; }
+    .station-row { display: flex; gap: 10px; align-items: center; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h1>RezTV Admin</h1>
+
+  <!-- Station Name -->
+  <section>
+    <h2>Station Name</h2>
+    <div class="station-row">
+      <input type="text" id="stationName" placeholder="Enter station name" style="width: 300px;">
+      <button onclick="saveStationName()">Save Station Name</button>
+    </div>
+    <p id="stationStatus"></p>
+  </section>
+
+  <!-- Upload -->
+  <section>
+    <h2>Upload Video</h2>
+    <form id="uploadForm">
+      <input type="file" id="videoFile" accept="video/*" required>
+      <button type="submit">Upload</button>
+    </form>
+    <p id="uploadStatus"></p>
+  </section>
+
+  <!-- Create Channel -->
+  <section>
+    <h2>Create Channel</h2>
+    <input type="text" id="playlistName" placeholder="Channel name">
+    <button onclick="createPlaylist()">Create Channel</button>
+    <p id="playlistStatus"></p>
+  </section>
+
+  <!-- Media Library -->
+  <section>
+    <h2>Media Library</h2>
+    <button onclick="loadMedia()">Refresh Media</button>
+    <ul id="mediaList"></ul>
+  </section>
+
+  <!-- Channels -->
+  <section>
+    <h2>Channels</h2>
+    <button onclick="loadPlaylists()">Refresh Channels</button>
+    <div id="playlistList"></div>
+  </section>
+
+  <script>
+    const API = "";
+
+    // ========== Station Name ==========
+    async function loadStationName() {
+      const res = await fetch(`${API}/settings`);
+      const data = await res.json();
+      document.getElementById("stationName").value = data.station_name || "RezTV";
+    }
+
+    async function saveStationName() {
+      const name = document.getElementById("stationName").value.trim();
+      if (!name) return alert("Please enter a station name");
+
+      const res = await fetch(`${API}/settings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ station_name: name })
+      });
+
+      if (res.ok) {
+        document.getElementById("stationStatus").innerHTML = `<span class="success">Station name saved</span>`;
+      } else {
+        document.getElementById("stationStatus").innerHTML = `<span class="error">Failed to save</span>`;
+      }
+    }
+
+    // ========== Upload with Progress ==========
+    document.getElementById("uploadForm").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fileInput = document.getElementById("videoFile");
+      const status = document.getElementById("uploadStatus");
+
+      if (!fileInput.files[0]) {
+        status.innerHTML = "Please select a file first.";
+        return;
+      }
+
+      const file = fileInput.files[0];
+      status.innerHTML = `
+        <div>Uploading <strong>${file.name}</strong>...</div>
+        <div style="margin-top:8px; background:#eee; border-radius:6px; overflow:hidden;">
+          <div id="progressBar" style="height:18px; width:0%; background:#4caf50; text-align:center; color:white; font-size:12px; line-height:18px;">0%</div>
+        </div>
+      `;
+
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const xhr = new XMLHttpRequest();
+
+      xhr.upload.addEventListener("progress", (event) => {
+        if (event.lengthComputable) {
+          const percent = Math.round((event.loaded / event.total) * 100);
+          const bar = document.getElementById("progressBar");
+          if (bar) {
+            bar.style.width = percent + "%";
+            bar.innerText = percent + "%";
+          }
+        }
+      });
+
+      xhr.addEventListener("load", () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          const data = JSON.parse(xhr.responseText);
+          status.innerHTML = `<span class="success">Successfully uploaded: ${data.filename} (ID: ${data.id})</span>`;
+          loadMedia();
+          fileInput.value = "";
+        } else {
+          status.innerHTML = `<span class="error">Upload failed (${xhr.status})</span>`;
+        }
+      });
+
+      xhr.addEventListener("error", () => {
+        status.innerHTML = `<span class="error">Upload failed – network error</span>`;
+      });
+
+      xhr.open("POST", `${API}/upload`);
+      xhr.send(formData);
+    });
+
+    // ========== Create Channel ==========
+    async function createPlaylist() {
+      const name = document.getElementById("playlistName").value.trim();
+      if (!name) return alert("Please enter a channel name");
+
+      const res = await fetch(`${API}/playlists`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name })
+      });
+      const data = await res.json();
+      document.getElementById("playlistStatus").innerHTML = `<span class="success">Created: ${data.name} (ID: ${data.id})</span>`;
+      document.getElementById("playlistName").value = "";
+      loadPlaylists();
+      loadMedia();
+    }
+
+    // ========== Load Media ==========
+    async function loadMedia() {
+      const [mediaRes, playlistsRes] = await Promise.all([
+        fetch(`${API}/media`),
+        fetch(`${API}/playlists`)
+      ]);
+
+      const media = await mediaRes.json();
+      const playlists = await playlistsRes.json();
+
+      const list = document.getElementById("mediaList");
+
+      if (media.length === 0) {
+        list.innerHTML = "<li>No media uploaded yet</li>";
+        return;
+      }
+
+      list.innerHTML = media.map(m => {
+        const options = playlists.map(p => `<option value="${p.id}">${p.name}</option>`).join("");
+        return `
+          <li>
+            <span>ID ${m.id}: ${m.original_filename || m.filename}</span>
+            <div>
+              <select id="select-${m.id}">
+                <option value="">Select channel...</option>
+                ${options}
+              </select>
+              <button onclick="addToPlaylist(${m.id})">Add</button>
+              <button onclick="deleteMedia(${m.id})" style="background:#ffdddd; color:#c00;">Delete</button>
+            </div>
+          </li>
+        `;
+      }).join("");
+    }
+
+    // ========== Add to Channel ==========
+    async function addToPlaylist(mediaId) {
+      const select = document.getElementById(`select-${mediaId}`);
+      const playlistId = select.value;
+
+      if (!playlistId) {
+        alert("Please select a channel first");
+        return;
+      }
+
+      const res = await fetch(`${API}/playlists/${playlistId}/media/${mediaId}`, {
+        method: "POST"
+      });
+
+      if (res.ok) {
+        alert(`Added media ${mediaId} to channel ${playlistId}`);
+        loadPlaylists();
+      } else {
+        const err = await res.json();
+        alert("Failed: " + (err.detail || "Unknown error"));
+      }
+    }
+
+    // ========== Load Channels ==========
+    async function loadPlaylists() {
+      const res = await fetch(`${API}/playlists`);
+      const playlists = await res.json();
+      const container = document.getElementById("playlistList");
+
+      if (playlists.length === 0) {
+        container.innerHTML = "<p>No channels yet</p>";
+        return;
+      }
+
+      container.innerHTML = "";
+
+      for (const p of playlists) {
+        const mediaRes = await fetch(`${API}/playlists/${p.id}/media`);
+        const mediaItems = await mediaRes.json();
+
+        const mediaListHtml = mediaItems.length === 0
+          ? `<p style="color:#888; margin:10px 0;">No videos in this channel</p>`
+          : `<ul class="sortable" data-playlist-id="${p.id}" style="list-style:none; padding:0; margin:12px 0;">
+              ${mediaItems.map(m => `
+                <li draggable="true" data-id="${m.id}" style="padding:10px; margin:6px 0; background:#f0f0f0; border-radius:6px; cursor:grab; display:flex; justify-content:space-between; align-items:center;">
+                  <span>${m.title || m.original_filename}</span>
+                  <span style="color:#888; font-size:0.85rem;">ID ${m.id}</span>
+                </li>
+              `).join("")}
+             </ul>`;
+
+        const box = document.createElement("div");
+        box.className = "playlist-box";
+        box.innerHTML = `
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:10px;">
+            <strong>ID ${p.id}: <span id="channel-name-${p.id}">${p.name}</span></strong>
+            <div>
+              <button onclick="editChannelName(${p.id})">Edit Name</button>
+            </div>
+          </div>
+          ${mediaListHtml}
+          <div style="margin-top: 12px;">
+            <button onclick="startStream(${p.id})">Start Stream</button>
+            <button onclick="stopStream(${p.id})">Stop Stream</button>
+            <a href="/hls/playlist_${p.id}/index.m3u8" target="_blank">Open Stream URL</a>
+            <button onclick="deletePlaylist(${p.id})" style="background:#ffdddd; color:#c00; margin-left: 10px;">Delete Channel</button>
+          </div>
+          <p id="stream-status-${p.id}" style="margin-top:8px;"></p>
+        `;
+        container.appendChild(box);
+      }
+
+      enableDragAndDrop();
+    }
+
+    // ========== Edit Channel Name ==========
+    async function editChannelName(id) {
+      const current = document.getElementById(`channel-name-${id}`).innerText;
+      const newName = prompt("Enter new channel name:", current);
+      if (!newName || newName.trim() === "" || newName === current) return;
+
+      const res = await fetch(`${API}/playlists/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: newName.trim() })
+      });
+
+      if (res.ok) {
+        loadPlaylists();
+      } else {
+        alert("Failed to rename channel");
+      }
+    }
+
+    // ========== Drag & Drop ==========
+    function enableDragAndDrop() {
+      document.querySelectorAll(".sortable").forEach(list => {
+        let draggedItem = null;
+
+        list.querySelectorAll("li").forEach(item => {
+          item.addEventListener("dragstart", (e) => {
+            draggedItem = item;
+            e.dataTransfer.effectAllowed = "move";
+            item.style.opacity = "0.5";
+          });
+
+          item.addEventListener("dragend", () => {
+            item.style.opacity = "1";
+            draggedItem = null;
+          });
+
+          item.addEventListener("dragover", (e) => e.preventDefault());
+
+          item.addEventListener("drop", (e) => {
+            e.preventDefault();
+            if (draggedItem && draggedItem !== item) {
+              const items = [...list.querySelectorAll("li")];
+              const draggedIndex = items.indexOf(draggedItem);
+              const targetIndex = items.indexOf(item);
+
+              if (draggedIndex < targetIndex) {
+                list.insertBefore(draggedItem, item.nextSibling);
+              } else {
+                list.insertBefore(draggedItem, item);
+              }
+              saveOrder(list);
+            }
+          });
+        });
+      });
+    }
+
+    async function saveOrder(list) {
+      const playlistId = list.dataset.playlistId;
+      const mediaIds = [...list.querySelectorAll("li")].map(li => parseInt(li.dataset.id));
+
+      await fetch(`${API}/playlists/${playlistId}/reorder`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ media_ids: mediaIds })
+      });
+    }
+
+    // ========== Start / Stop Stream ==========
+    async function startStream(playlistId) {
+      const status = document.getElementById(`stream-status-${playlistId}`);
+      status.innerText = "Starting stream...";
+
+      const res = await fetch(`${API}/playlists/${playlistId}/start`, { method: "POST" });
+      const data = await res.json();
+
+      if (res.ok) {
+        status.innerHTML = `<span class="success">Stream running! → <a href="${data.stream_url}" target="_blank">${data.stream_url}</a></span>`;
+      } else {
+        status.innerHTML = `<span class="error">Error: ${data.detail || JSON.stringify(data)}</span>`;
+      }
+    }
+
+    async function stopStream(playlistId) {
+      const status = document.getElementById(`stream-status-${playlistId}`);
+      await fetch(`${API}/playlists/${playlistId}/stop`, { method: "POST" });
+      status.innerText = "Stream stopped";
+    }
+
+    // ========== Delete ==========
+    async function deleteMedia(mediaId) {
+      if (!confirm(`Are you sure you want to delete media ID ${mediaId}?`)) return;
+
+      const res = await fetch(`${API}/media/${mediaId}`, { method: "DELETE" });
+      if (res.ok) {
+        loadMedia();
+        loadPlaylists();
+      } else {
+        alert("Failed to delete media");
+      }
+    }
+
+    async function deletePlaylist(playlistId) {
+      if (!confirm(`Are you sure you want to delete this channel?`)) return;
+
+      const res = await fetch(`${API}/playlists/${playlistId}`, { method: "DELETE" });
+      if (res.ok) {
+        loadPlaylists();
+        loadMedia();
+      } else {
+        alert("Failed to delete channel");
+      }
+    }
+
+    // Initial load
+    loadStationName();
+    loadMedia();
+    loadPlaylists();
+  </script>
+</body>
+</html>

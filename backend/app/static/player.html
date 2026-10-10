@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Channel</title>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; color: white; font-family: Arial, sans-serif; height: 100vh; display: flex; flex-direction: column; }
+    header { padding: 12px 20px; background: #111; display: flex; justify-content: space-between; align-items: center; }
+    header h1 { font-size: 1.3rem; }
+    #video-container { flex: 1; display: flex; justify-content: center; align-items: center; background: #000; position: relative; }
+    video { width: 100%; height: 100%; max-height: 100vh; }
+    .info { padding: 10px 20px; background: #111; font-size: 0.9rem; color: #aaa; }
+    #unmute-overlay {
+      position: absolute;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.6);
+      display: none;
+      justify-content: center;
+      align-items: center;
+      flex-direction: column;
+      cursor: pointer;
+      z-index: 10;
+    }
+    #unmute-overlay button {
+      padding: 14px 28px;
+      font-size: 1.1rem;
+      background: #e10600;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1 id="station-name">Loading...</h1>
+    <div id="channel-name">Channel</div>
+  </header>
+
+  <div id="video-container">
+    <video id="video" controls playsinline></video>
+    <div id="unmute-overlay">
+      <button>Click to Unmute & Play</button>
+    </div>
+  </div>
+
+  <div class="info">
+    <span id="status">Loading stream...</span>
+  </div>
+
+  <script>
+    const pathParts = window.location.pathname.split('/');
+    const channelId = pathParts[pathParts.length - 1] || 1;
+    document.getElementById("channel-name").innerText = `Channel ${channelId}`;
+
+    // Load station name
+    fetch("/settings")
+      .then(res => res.json())
+      .then(data => {
+        const name = data.station_name || "RezTV";
+        document.getElementById("station-name").innerText = name;
+        document.title = name + " - Channel " + channelId;
+      })
+      .catch(() => {
+        document.getElementById("station-name").innerText = "RezTV";
+      });
+
+    const video = document.getElementById('video');
+    const status = document.getElementById('status');
+    const overlay = document.getElementById('unmute-overlay');
+    const streamUrl = `/hls/playlist_${channelId}/index.m3u8`;
+
+    function tryPlay(unmuted = true) {
+      video.muted = !unmuted;
+      const playPromise = video.play();
+
+      if (playPromise !== undefined) {
+        playPromise.then(() => {
+          status.innerText = unmuted ? "Playing" : "Playing (muted)";
+          overlay.style.display = "none";
+        }).catch(() => {
+          video.muted = true;
+          video.play().then(() => {
+            status.innerText = "Playing (muted) – click to unmute";
+            overlay.style.display = "flex";
+          });
+        });
+      }
+    }
+
+    overlay.addEventListener("click", () => {
+      tryPlay(true);
+    });
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        backBufferLength: 90,
+        maxBufferLength: 60,
+        maxMaxBufferLength: 120,
+        maxBufferHole: 0.5
+      });
+
+      hls.loadSource(streamUrl);
+      hls.attachMedia(video);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        tryPlay(true);
+      });
+
+      hls.on(Hls.Events.ERROR, (event, data) => {
+        if (data.fatal) {
+          status.innerText = "Stream error – is the channel started?";
+        }
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = streamUrl;
+      video.addEventListener('loadedmetadata', () => {
+        tryPlay(true);
+      });
+    } else {
+      status.innerText = "HLS is not supported in this browser";
+    }
+  </script>
+</body>
+</html>

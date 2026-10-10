@@ -1,0 +1,33 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: reztv-db
+    environment:
+      POSTGRES_USER: reztv
+      POSTGRES_PASSWORD: reztvpassword
+      POSTGRES_DB: reztv
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    container_name: reztv-backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://reztv:reztvpassword@db:5432/reztv
+      MEDIA_PATH: /app/media
+      HLS_PATH: /app/hls
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: groked
+    volumes:
+      - ./media:/app/media
+      - ./hls:/app/hls
+      - ./backend:/app
+    depends_on:
+      - db
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

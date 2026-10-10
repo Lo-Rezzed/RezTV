@@ -1,0 +1,10 @@
+# Media and generated files
+media/
+hls/
+__pycache__/
+*.pyc
+.env
+*.log
+
+# Docker volumes
+postgres_data/
