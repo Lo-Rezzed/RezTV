@@ -21,6 +21,6 @@ Upload videos, create channels, schedule continuous playout, and share a clean p
 ## Quick Start (Docker)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/RezTV.git
+git clone https://github.com/Lo-Rezzed/RezTV.git
 cd RezTV
 docker compose up -d --build
