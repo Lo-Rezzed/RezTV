@@ -3,7 +3,7 @@
 ## First Login
 
 1. Open your admin panel: `https://yourdomain.com/admin`
-2. You will be asked for a username and password (set in `docker-compose.yml`)
+2. You will be asked for a username and password (the `ADMIN_USERNAME` and `ADMIN_PASSWORD` you set in your `.env` file)
 3. After logging in you will see the admin dashboard
 
 ## Setting Your Station Name
