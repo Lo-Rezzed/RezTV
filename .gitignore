@@ -1,6 +1,7 @@
 # Media and generated files
 media/
 hls/
+logs/
 __pycache__/
 *.pyc
 .env

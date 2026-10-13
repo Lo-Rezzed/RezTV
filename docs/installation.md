@@ -74,4 +74,6 @@ git pull
 docker compose up -d --build
 ```
 
-Code changes only take effect after the rebuild (the server no longer auto-reloads code). Channels need **Start Stream** pressed again after an update.
+Code changes only take effect after the rebuild (the server no longer auto-reloads code). Channels that were on before the update come back on by themselves (this needs RezTV from the stream-reliability update onward; on older versions press **Start Stream** again). Both containers use `restart: unless-stopped`, so RezTV also comes back after a server reboot.
+
+RezTV must run as a single process (the default). Don't add `--workers` to the start command, because each worker would start its own copy of every channel.

@@ -308,21 +308,28 @@
     }
 
     // ========== Load Channels ==========
+    // Several actions call loadPlaylists() back to back. Each call gets a number;
+    // only the newest one is allowed to touch the page, and it swaps in a fully
+    // built list in one step, so channels can no longer show up twice.
+    let loadPlaylistsGen = 0;
     async function loadPlaylists() {
+      const gen = ++loadPlaylistsGen;
       const res = await fetch(`${API}/playlists`);
       const playlists = await res.json();
       const container = document.getElementById("playlistList");
+      if (gen !== loadPlaylistsGen) return;
 
       if (playlists.length === 0) {
         container.innerHTML = "<p>No channels yet</p>";
         return;
       }
 
-      container.innerHTML = "";
+      const fragment = document.createDocumentFragment();
 
       for (const p of playlists) {
         const mediaRes = await fetch(`${API}/playlists/${p.id}/media`);
         const mediaItems = await mediaRes.json();
+        if (gen !== loadPlaylistsGen) return;
 
         const mediaListHtml = mediaItems.length === 0
           ? `<p style="color:#888; margin:10px 0;">No videos in this channel</p>`
@@ -351,13 +358,17 @@
           <div style="margin-top: 12px;">
             <button onclick="startStream(${p.id})">Start Stream</button>
             <button onclick="stopStream(${p.id})">Stop Stream</button>
+            <button onclick="showStreamLog(${p.id})">Status &amp; Log</button>
             <a href="/hls/playlist_${p.id}/index.m3u8" target="_blank">Open Stream URL</a>
             <button onclick="deletePlaylist(${p.id})" style="background:#ffdddd; color:#c00; margin-left: 10px;">Delete Channel</button>
           </div>
           <p id="stream-status-${p.id}" style="margin-top:8px;"></p>
+          <pre id="stream-log-${p.id}" style="display:none; max-height:300px; overflow:auto; background:#111; color:#ddd; padding:8px; font-size:0.8rem; white-space:pre-wrap;"></pre>
         `;
-        container.appendChild(box);
+        fragment.appendChild(box);
       }
+      if (gen !== loadPlaylistsGen) return;
+      container.replaceChildren(fragment);
 
       enableDragAndDrop();
     }
@@ -431,6 +442,20 @@
     }
 
     // ========== Start / Stop Stream ==========
+    async function showStreamLog(playlistId) {
+      const pre = document.getElementById(`stream-log-${playlistId}`);
+      if (pre.style.display === "block") { pre.style.display = "none"; return; }
+      const res = await fetch(`${API}/playlists/${playlistId}/status?lines=100`);
+      const d = await res.json();
+      if (!res.ok) { alert("Failed: " + (d.detail || "Unknown error")); return; }
+      const state = !d.running ? "Stopped"
+        : (d.ffmpeg_alive ? "On air" : "Restarting after a problem");
+      const head = `Status: ${state} | restarts: ${d.restarts ?? 0}` +
+        (d.last_exit_code != null ? ` | last exit code: ${d.last_exit_code}` : "");
+      pre.textContent = head + "\n\n" + (d.log.length ? d.log.join("\n") : "(no log yet)");
+      pre.style.display = "block";
+    }
+
     async function startStream(playlistId) {
       const status = document.getElementById(`stream-status-${playlistId}`);
       status.innerText = "Starting stream...";

@@ -66,6 +66,16 @@ To add a whole folder at once:
 2. Click **Start Stream**
 3. Wait a few seconds, then open the channel page or the public player
 
+A started channel stays on until you click **Stop Stream**:
+
+- If the stream crashes, RezTV restarts it automatically. It waits a little longer after each failure in a row (2 s, 4 s, 8 s ... up to 5 minutes) so a broken file can't overload the server.
+- If the server or RezTV restarts, every channel that was on comes back on by itself.
+- Click **Status & Log** under a channel to see whether it's on air, how many times it has restarted, and the last lines of its stream log. That's the first place to look when a channel goes quiet.
+
+## Stream logs
+
+Each channel writes its stream log to `logs/channel_<ID>.log` in the RezTV folder on the server. Logs are capped at 1 MB each (change with `STREAM_LOG_MAX_KB` in `.env`), and the two previous logs are kept as `.log.1` and `.log.2`.
+
 ## Public Pages
 
 - Landing page: `https://yourdomain.com`
