@@ -40,7 +40,7 @@ nano .env              # paste in your own ADMIN_PASSWORD and POSTGRES_PASSWORD
 
 > If you change `POSTGRES_PASSWORD` after the database was first created, the existing database keeps the old one. For a fresh install, remove the old volume first: `docker compose down -v` (this deletes all channel and media records).
 
-Then open `http://your-server-ip:8000/admin` and log in with the username and password from your `.env`.
+RezTV only listens on the server itself (`127.0.0.1:8000`), so it is not reachable from the internet until you set up nginx. Follow [Domain & SSL](docs/domain-ssl.md) to put it on your domain with HTTPS, then open `https://yourdomain.com/admin`. To test before nginx is set up, use an SSH tunnel from your own computer: `ssh -L 8000:localhost:8000 root@your-server-ip`, then open `http://localhost:8000/admin`. Log in with the username and password from your `.env`.
 
 ## Documentation
 

@@ -1,10 +1,14 @@
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import inspect, text, func
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
+import subprocess
+import time
+import threading
+from collections import defaultdict, deque
+from fastapi import Request
 from typing import List
 import os
-import shutil
 import uuid
 import re
 
@@ -45,17 +49,44 @@ app = FastAPI(title="RezTV", version="0.1.0")
 security = HTTPBasic()
 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+if not ADMIN_PASSWORD:
+    raise RuntimeError("ADMIN_PASSWORD is not set. Put it in your .env file before starting RezTV.")
 
-def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
+# Simple login rate limiting: too many failed logins from one IP locks it out for a while.
+LOGIN_MAX_FAILURES = int(os.getenv("LOGIN_MAX_FAILURES", "5"))
+LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "900"))
+_failed_logins: dict[str, deque] = defaultdict(deque)
+_failed_lock = threading.Lock()
+
+def _client_ip(request: Request) -> str:
+    # Behind nginx the real address arrives in X-Real-IP / X-Forwarded-For.
+    # Port 8000 is bound to 127.0.0.1 so only nginx can set these.
+    fwd = request.headers.get("x-real-ip") or request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    return fwd or (request.client.host if request.client else "unknown")
+
+def verify_admin(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
+    ip = _client_ip(request)
+    now = time.monotonic()
+    with _failed_lock:
+        q = _failed_logins[ip]
+        while q and now - q[0] > LOGIN_WINDOW_SECONDS:
+            q.popleft()
+        if len(q) >= LOGIN_MAX_FAILURES:
+            raise HTTPException(status_code=429, detail="Too many failed logins. Try again later.",
+                                headers={"Retry-After": str(int(LOGIN_WINDOW_SECONDS - (now - q[0])) + 1)})
     correct_username = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
     correct_password = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
     if not (correct_username and correct_password):
+        with _failed_lock:
+            _failed_logins[ip].append(now)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Basic"},
         )
+    with _failed_lock:
+        _failed_logins.pop(ip, None)
     return credentials.username
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
@@ -68,9 +99,61 @@ app.mount("/hls", StaticFiles(directory=HLS_PATH), name="hls")
 os.makedirs(MEDIA_PATH, exist_ok=True)
 os.makedirs(HLS_PATH, exist_ok=True)
 
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "2048")) * 1024 * 1024
+ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
+CHUNK_SIZE = 1024 * 1024
+
+def _clean_text(v: str) -> str:
+    v = re.sub(r"[\x00-\x1f\x7f]", "", v).strip()
+    if not v:
+        raise ValueError("must not be empty")
+    return v
+
 class PlaylistCreate(BaseModel):
-    name: str
-    description: str | None = None
+    name: str = Field(max_length=100)
+    description: str | None = Field(default=None, max_length=500)
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v):
+        return _clean_text(v)
+class PlaylistUpdate(BaseModel):
+    model_config = {"extra": "forbid"}
+    name: str | None = Field(default=None, max_length=100)
+    description: str | None = Field(default=None, max_length=500)
+    @field_validator("name")
+    @classmethod
+    def _name(cls, v):
+        return None if v is None else _clean_text(v)
+class SettingsUpdate(BaseModel):
+    model_config = {"extra": "forbid"}
+    station_name: str | None = Field(default=None, max_length=100)
+    @field_validator("station_name")
+    @classmethod
+    def _sn(cls, v):
+        return None if v is None else _clean_text(v)
+
+def media_public(m: Media) -> dict:
+    # Never expose server file paths or stored filenames.
+    return {"id": m.id, "title": m.title or m.original_filename,
+            "original_filename": m.original_filename, "folder": m.folder,
+            "duration": m.duration, "created_at": m.created_at}
+
+def playlist_public(p: Playlist) -> dict:
+    return {"id": p.id, "name": p.name, "description": p.description, "created_at": p.created_at}
+
+def probe_video(path: str) -> float | None:
+    """Return duration if ffprobe finds a video stream, else raise ValueError."""
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                            "-show_entries", "stream=codec_type:format=duration",
+                            "-of", "default=noprint_wrappers=1", path],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise ValueError(f"could not check file: {e}")
+    if r.returncode != 0 or "codec_type=video" not in r.stdout:
+        raise ValueError("not a readable video file")
+    m = re.search(r"duration=([0-9.]+)", r.stdout)
+    return float(m.group(1)) if m else None
 class ReorderRequest(BaseModel):
     media_ids: List[int]
 class MediaUpdate(BaseModel):
@@ -122,22 +205,39 @@ async def upload_video(
     db: Session = Depends(get_db),
     username: str = Depends(verify_admin)
 ):
-    ext = os.path.splitext(file.filename)[1]
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Only MP4, MOV, MKV and WebM files are allowed")
     unique_name = f"{uuid.uuid4()}{ext}"
     folder_name = clean_folder_name(folder)
     folder_dir = os.path.join(MEDIA_PATH, folder_name)
     os.makedirs(folder_dir, exist_ok=True)
     file_location = os.path.join(folder_dir, unique_name)
 
-    with open(file_location, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    written = 0
+    try:
+        with open(file_location, "wb") as buffer:
+            while chunk := await file.read(CHUNK_SIZE):
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail=f"File is larger than {MAX_UPLOAD_BYTES // (1024*1024)} MB")
+                buffer.write(chunk)
+        duration = probe_video(file_location)
+    except ValueError as e:
+        os.remove(file_location)
+        raise HTTPException(status_code=400, detail=f"Rejected: {e}")
+    except BaseException:
+        if os.path.exists(file_location):
+            os.remove(file_location)
+        raise
 
     media = Media(
         filename=unique_name,
         original_filename=file.filename,
         title=file.filename,
         filepath=file_location,
-        folder=folder_name
+        folder=folder_name,
+        duration=duration
     )
     db.add(media)
     db.commit()
@@ -151,14 +251,15 @@ async def upload_video(
     }
 
 @app.get("/media")
-async def list_media(folder: str | None = None, db: Session = Depends(get_db)):
+async def list_media(folder: str | None = None, db: Session = Depends(get_db),
+                     username: str = Depends(verify_admin)):
     query = db.query(Media)
     if folder:
         query = query.filter(Media.folder == clean_folder_name(folder))
-    return query.order_by(Media.id).all()
+    return [media_public(m) for m in query.order_by(Media.id).all()]
 
 @app.get("/media/folders")
-async def list_folders(db: Session = Depends(get_db)):
+async def list_folders(db: Session = Depends(get_db), username: str = Depends(verify_admin)):
     rows = db.query(Media.folder, func.count(Media.id)).group_by(Media.folder).order_by(Media.folder).all()
     return [{"name": name, "count": count} for name, count in rows]
 
@@ -180,7 +281,7 @@ async def update_media(
         media.title = data.title.strip()
     db.commit()
     db.refresh(media)
-    return media
+    return media_public(media)
 
 @app.post("/playlists")
 async def create_playlist(
@@ -192,11 +293,11 @@ async def create_playlist(
     db.add(db_playlist)
     db.commit()
     db.refresh(db_playlist)
-    return db_playlist
+    return playlist_public(db_playlist)
 
 @app.get("/playlists")
 async def list_playlists(db: Session = Depends(get_db)):
-    return db.query(Playlist).all()
+    return [playlist_public(p) for p in db.query(Playlist).order_by(Playlist.id).all()]
 @app.post("/playlists/{playlist_id}/media/{media_id}")
 async def add_media_to_playlist(
     playlist_id: int,
@@ -257,7 +358,7 @@ async def get_playlist(playlist_id: int, db: Session = Depends(get_db)):
     playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
-    return playlist
+    return playlist_public(playlist)
 
 @app.get("/channel/{channel_id}")
 async def channel_page(channel_id: int):
@@ -336,7 +437,8 @@ async def delete_playlist(
     db.commit()
     return {"status": "deleted", "playlist_id": playlist_id}
 @app.get("/playlists/{playlist_id}/media")
-async def get_playlist_media(playlist_id: int, db: Session = Depends(get_db)):
+async def get_playlist_media(playlist_id: int, db: Session = Depends(get_db),
+                             username: str = Depends(verify_admin)):
     playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
@@ -394,7 +496,7 @@ async def get_settings(db: Session = Depends(get_db)):
 
 @app.post("/settings")
 async def update_settings(
-    data: dict,
+    data: SettingsUpdate,
     db: Session = Depends(get_db),
     username: str = Depends(verify_admin)
 ):
@@ -403,8 +505,8 @@ async def update_settings(
         settings = Settings()
         db.add(settings)
     
-    if "station_name" in data:
-        settings.station_name = data["station_name"]
+    if data.station_name is not None:
+        settings.station_name = data.station_name
     
     db.commit()
     return {"station_name": settings.station_name}
@@ -413,7 +515,7 @@ async def update_settings(
 @app.put("/playlists/{playlist_id}")
 async def rename_playlist(
     playlist_id: int,
-    data: dict,
+    data: PlaylistUpdate,
     db: Session = Depends(get_db),
     username: str = Depends(verify_admin)
 ):
@@ -421,8 +523,10 @@ async def rename_playlist(
     if not playlist:
         raise HTTPException(status_code=404, detail="Channel not found")
     
-    if "name" in data:
-        playlist.name = data["name"]
-        db.commit()
-    
-    return playlist
+    if data.name is not None:
+        playlist.name = data.name
+    if data.description is not None:
+        playlist.description = data.description.strip() or None
+    db.commit()
+    db.refresh(playlist)
+    return playlist_public(playlist)

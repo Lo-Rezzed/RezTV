@@ -13,6 +13,9 @@ bash
 apt update
 apt install -y nginx
 3. Create Nginx configuration
+
+RezTV only listens on `127.0.0.1:8000`, so nginx is the only way in from the internet. Keep the `X-Real-IP` line: login rate limiting uses it to tell visitors apart.
+
 bash
 nano /etc/nginx/sites-available/reztv
 Paste the following (replace yourdomain.com with your real domain):
@@ -22,7 +25,10 @@ server {
     listen 80;
     server_name yourdomain.com www.yourdomain.com;
 
+    # Match MAX_UPLOAD_MB in .env (default 2048 MB)
     client_max_body_size 2G;
+    proxy_request_buffering off;
+    proxy_read_timeout 600s;
 
     location / {
         proxy_pass http://127.0.0.1:8000;
