@@ -11,4 +11,5 @@ class Media(Base):
     title = Column(String, nullable=True)
     duration = Column(Float, nullable=True)          # in seconds
     filepath = Column(String, nullable=False)
+    folder = Column(String, nullable=False, default="Unsorted", server_default="Unsorted")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
