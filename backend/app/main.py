@@ -1,10 +1,12 @@
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import inspect, text, func
 from pydantic import BaseModel
 from typing import List
 import os
 import shutil
 import uuid
+import re
 
 from app.services.hls import start_playlist_stream, stop_playlist_stream
 from fastapi.staticfiles import StaticFiles
@@ -19,6 +21,25 @@ from fastapi import status
 import secrets
 
 Base.metadata.create_all(bind=engine)
+
+# Lightweight migration: older databases were created before media folders existed.
+# Add the column in place so existing media keeps working (it lands in "Unsorted").
+def _ensure_media_folder_column():
+    columns = [c["name"] for c in inspect(engine).get_columns("media")]
+    if "folder" not in columns:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE media ADD COLUMN folder VARCHAR NOT NULL DEFAULT 'Unsorted'"))
+
+_ensure_media_folder_column()
+
+DEFAULT_FOLDER = "Unsorted"
+
+def clean_folder_name(name: str | None) -> str:
+    """Folder names are also used as directory names, so keep them simple and safe."""
+    name = (name or "").strip()
+    name = re.sub(r"[^A-Za-z0-9 _-]", "", name)
+    name = re.sub(r"\s+", " ", name).strip()[:64]
+    return name or DEFAULT_FOLDER
 
 app = FastAPI(title="RezTV", version="0.1.0")
 security = HTTPBasic()
@@ -52,6 +73,35 @@ class PlaylistCreate(BaseModel):
     description: str | None = None
 class ReorderRequest(BaseModel):
     media_ids: List[int]
+class MediaUpdate(BaseModel):
+    folder: str | None = None
+    title: str | None = None
+class FolderRequest(BaseModel):
+    folder: str
+
+def next_position(db: Session, playlist_id: int) -> int:
+    current = db.query(func.max(playlist_media.c.position)).filter(
+        playlist_media.c.playlist_id == playlist_id
+    ).scalar()
+    return 0 if current is None else current + 1
+
+def append_to_playlist(db: Session, playlist_id: int, media_id: int) -> bool:
+    """Add media to the end of a playlist. Returns False if it was already there."""
+    exists = db.execute(
+        playlist_media.select().where(
+            (playlist_media.c.playlist_id == playlist_id) & (playlist_media.c.media_id == media_id)
+        )
+    ).first()
+    if exists:
+        return False
+    db.execute(
+        playlist_media.insert().values(
+            playlist_id=playlist_id,
+            media_id=media_id,
+            position=next_position(db, playlist_id)
+        )
+    )
+    return True
 
 @app.get("/")
 async def root():
@@ -68,12 +118,16 @@ async def admin_page(username: str = Depends(verify_admin)):
 @app.post("/upload")
 async def upload_video(
     file: UploadFile = File(...),
+    folder: str = Form(""),
     db: Session = Depends(get_db),
     username: str = Depends(verify_admin)
 ):
     ext = os.path.splitext(file.filename)[1]
     unique_name = f"{uuid.uuid4()}{ext}"
-    file_location = os.path.join(MEDIA_PATH, unique_name)
+    folder_name = clean_folder_name(folder)
+    folder_dir = os.path.join(MEDIA_PATH, folder_name)
+    os.makedirs(folder_dir, exist_ok=True)
+    file_location = os.path.join(folder_dir, unique_name)
 
     with open(file_location, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
@@ -82,7 +136,8 @@ async def upload_video(
         filename=unique_name,
         original_filename=file.filename,
         title=file.filename,
-        filepath=file_location
+        filepath=file_location,
+        folder=folder_name
     )
     db.add(media)
     db.commit()
@@ -91,12 +146,41 @@ async def upload_video(
     return {
         "id": media.id,
         "filename": media.original_filename,
+        "folder": media.folder,
         "status": "uploaded"
     }
 
 @app.get("/media")
-async def list_media(db: Session = Depends(get_db)):
-    return db.query(Media).all()
+async def list_media(folder: str | None = None, db: Session = Depends(get_db)):
+    query = db.query(Media)
+    if folder:
+        query = query.filter(Media.folder == clean_folder_name(folder))
+    return query.order_by(Media.id).all()
+
+@app.get("/media/folders")
+async def list_folders(db: Session = Depends(get_db)):
+    rows = db.query(Media.folder, func.count(Media.id)).group_by(Media.folder).order_by(Media.folder).all()
+    return [{"name": name, "count": count} for name, count in rows]
+
+@app.put("/media/{media_id}")
+async def update_media(
+    media_id: int,
+    data: MediaUpdate,
+    db: Session = Depends(get_db),
+    username: str = Depends(verify_admin)
+):
+    # Moving only changes the folder label. The file stays where it is on disk,
+    # so channels that are streaming it keep working.
+    media = db.query(Media).filter(Media.id == media_id).first()
+    if not media:
+        raise HTTPException(status_code=404, detail="Media not found")
+    if data.folder is not None:
+        media.folder = clean_folder_name(data.folder)
+    if data.title is not None and data.title.strip():
+        media.title = data.title.strip()
+    db.commit()
+    db.refresh(media)
+    return media
 
 @app.post("/playlists")
 async def create_playlist(
@@ -126,11 +210,47 @@ async def add_media_to_playlist(
     if not playlist or not media:
         raise HTTPException(status_code=404, detail="Playlist or Media not found")
 
-    if media not in playlist.media_items:
-        playlist.media_items.append(media)
-        db.commit()
+    append_to_playlist(db, playlist_id, media_id)
+    db.commit()
 
     return {"status": "added", "playlist_id": playlist_id, "media_id": media_id}
+
+@app.delete("/playlists/{playlist_id}/media/{media_id}")
+async def remove_media_from_playlist(
+    playlist_id: int,
+    media_id: int,
+    db: Session = Depends(get_db),
+    username: str = Depends(verify_admin)
+):
+    # Takes the video off this channel only. The file stays in the media library.
+    result = db.execute(
+        playlist_media.delete().where(
+            (playlist_media.c.playlist_id == playlist_id) & (playlist_media.c.media_id == media_id)
+        )
+    )
+    db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="That video is not in this channel")
+    return {"status": "removed", "playlist_id": playlist_id, "media_id": media_id}
+
+@app.post("/playlists/{playlist_id}/folder")
+async def add_folder_to_playlist(
+    playlist_id: int,
+    data: FolderRequest,
+    db: Session = Depends(get_db),
+    username: str = Depends(verify_admin)
+):
+    playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    folder_name = clean_folder_name(data.folder)
+    media_items = db.query(Media).filter(Media.folder == folder_name).order_by(Media.id).all()
+    if not media_items:
+        raise HTTPException(status_code=404, detail="Folder is empty or does not exist")
+    added = [m.id for m in media_items if append_to_playlist(db, playlist_id, m.id)]
+    db.commit()
+    return {"status": "added", "playlist_id": playlist_id, "folder": folder_name, "added": added,
+            "skipped": len(media_items) - len(added)}
 
 @app.get("/playlists/{playlist_id}")
 async def get_playlist(playlist_id: int, db: Session = Depends(get_db)):
@@ -193,6 +313,7 @@ async def delete_media(
     except Exception as e:
         print(f"Error deleting file: {e}")
 
+    db.execute(playlist_media.delete().where(playlist_media.c.media_id == media_id))
     db.delete(media)
     db.commit()
     return {"status": "deleted", "media_id": media_id}
@@ -224,7 +345,8 @@ async def get_playlist_media(playlist_id: int, db: Session = Depends(get_db)):
         {
             "id": m.id,
             "title": m.title or m.original_filename,
-            "original_filename": m.original_filename
+            "original_filename": m.original_filename,
+            "folder": m.folder
         }
         for m in playlist.media_items
     ]

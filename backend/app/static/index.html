@@ -15,6 +15,13 @@
     .success { color: green; }
     .error { color: crimson; }
     .playlist-box { background: #fafafa; padding: 15px; margin-bottom: 15px; border-radius: 8px; border: 1px solid #eee; }
+    .library { display: flex; gap: 20px; align-items: flex-start; margin-top: 10px; }
+    .folder-sidebar { width: 200px; flex-shrink: 0; border-right: 1px solid #eee; padding-right: 15px; }
+    .folder-sidebar li { padding: 7px 8px; cursor: pointer; border-radius: 5px; border-bottom: none; }
+    .folder-sidebar li:hover { background: #f0f0f0; }
+    .folder-sidebar li.active { background: #e0e0e0; font-weight: bold; }
+    .library-main { flex: 1; min-width: 0; }
+    .folder-bar { background: #fafafa; border: 1px solid #eee; border-radius: 8px; padding: 10px; margin-bottom: 10px; }
     .station-row { display: flex; gap: 10px; align-items: center; margin-top: 10px; }
   </style>
 </head>
@@ -36,6 +43,8 @@
     <h2>Upload Video</h2>
     <form id="uploadForm">
       <input type="file" id="videoFile" accept="video/*" required>
+      <input type="text" id="uploadFolder" list="folderOptions" placeholder="Folder (optional)">
+      <datalist id="folderOptions"></datalist>
       <button type="submit">Upload</button>
     </form>
     <p id="uploadStatus"></p>
@@ -53,7 +62,20 @@
   <section>
     <h2>Media Library</h2>
     <button onclick="loadMedia()">Refresh Media</button>
-    <ul id="mediaList"></ul>
+    <div class="library">
+      <div class="folder-sidebar">
+        <strong>Folders</strong>
+        <ul id="folderList"></ul>
+      </div>
+      <div class="library-main">
+        <div class="folder-bar" id="folderBar" style="display:none;">
+          Add everything in <strong id="folderBarName"></strong> to
+          <select id="folderChannelSelect"></select>
+          <button onclick="addFolderToPlaylist()">Add Folder to Channel</button>
+        </div>
+        <ul id="mediaList"></ul>
+      </div>
+    </div>
   </section>
 
   <!-- Channels -->
@@ -111,6 +133,7 @@
 
       const formData = new FormData();
       formData.append("file", file);
+      formData.append("folder", document.getElementById("uploadFolder").value.trim());
 
       const xhr = new XMLHttpRequest();
 
@@ -128,7 +151,7 @@
       xhr.addEventListener("load", () => {
         if (xhr.status >= 200 && xhr.status < 300) {
           const data = JSON.parse(xhr.responseText);
-          status.innerHTML = `<span class="success">Successfully uploaded: ${data.filename} (ID: ${data.id})</span>`;
+          status.innerHTML = `<span class="success">Successfully uploaded: ${data.filename} (ID: ${data.id}) to ${data.folder}</span>`;
           loadMedia();
           fileInput.value = "";
         } else {
@@ -162,14 +185,39 @@
     }
 
     // ========== Load Media ==========
+    let currentFolder = "";  // "" means all folders
+
+    function selectFolder(name) {
+      currentFolder = name;
+      loadMedia();
+    }
+
     async function loadMedia() {
-      const [mediaRes, playlistsRes] = await Promise.all([
-        fetch(`${API}/media`),
-        fetch(`${API}/playlists`)
+      const mediaUrl = currentFolder ? `${API}/media?folder=${encodeURIComponent(currentFolder)}` : `${API}/media`;
+      const [mediaRes, playlistsRes, foldersRes] = await Promise.all([
+        fetch(mediaUrl),
+        fetch(`${API}/playlists`),
+        fetch(`${API}/media/folders`)
       ]);
 
       const media = await mediaRes.json();
       const playlists = await playlistsRes.json();
+      const folders = await foldersRes.json();
+
+      // Folder sidebar
+      if (currentFolder && !folders.some(f => f.name === currentFolder)) currentFolder = "";
+      const total = folders.reduce((sum, f) => sum + f.count, 0);
+      document.getElementById("folderList").innerHTML =
+        `<li class="${currentFolder === "" ? "active" : ""}" onclick="selectFolder('')">All media (${total})</li>` +
+        folders.map(f => `<li class="${currentFolder === f.name ? "active" : ""}" onclick="selectFolder('${f.name}')">${f.name} (${f.count})</li>`).join("");
+      document.getElementById("folderOptions").innerHTML = folders.map(f => `<option value="${f.name}">`).join("");
+
+      // "Add whole folder to channel" bar
+      const folderBar = document.getElementById("folderBar");
+      folderBar.style.display = currentFolder ? "block" : "none";
+      document.getElementById("folderBarName").innerText = currentFolder;
+      document.getElementById("folderChannelSelect").innerHTML =
+        `<option value="">Select channel...</option>` + playlists.map(p => `<option value="${p.id}">${p.name}</option>`).join("");
 
       const list = document.getElementById("mediaList");
 
@@ -182,8 +230,9 @@
         const options = playlists.map(p => `<option value="${p.id}">${p.name}</option>`).join("");
         return `
           <li>
-            <span>ID ${m.id}: ${m.original_filename || m.filename}</span>
+            <span>ID ${m.id}: ${m.original_filename || m.filename} <span style="color:#888; font-size:0.85rem;">[${m.folder}]</span></span>
             <div>
+              <button onclick="moveMedia(${m.id}, '${m.folder}')">Move</button>
               <select id="select-${m.id}">
                 <option value="">Select channel...</option>
                 ${options}
@@ -219,6 +268,45 @@
       }
     }
 
+    // ========== Folders ==========
+    async function moveMedia(mediaId, current) {
+      const folder = prompt("Move to folder (type a new name to create one):", current);
+      if (folder === null || folder.trim() === "" || folder.trim() === current) return;
+
+      const res = await fetch(`${API}/media/${mediaId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ folder: folder.trim() })
+      });
+
+      if (res.ok) {
+        loadMedia();
+        loadPlaylists();
+      } else {
+        alert("Failed to move media");
+      }
+    }
+
+    async function addFolderToPlaylist() {
+      const playlistId = document.getElementById("folderChannelSelect").value;
+      if (!playlistId) return alert("Please select a channel first");
+
+      const res = await fetch(`${API}/playlists/${playlistId}/folder`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ folder: currentFolder })
+      });
+      const data = await res.json();
+
+      if (res.ok) {
+        const skipped = data.skipped ? ` (${data.skipped} already in the channel)` : "";
+        alert(`Added ${data.added.length} videos from ${data.folder} to channel ${playlistId}${skipped}`);
+        loadPlaylists();
+      } else {
+        alert("Failed: " + (data.detail || "Unknown error"));
+      }
+    }
+
     // ========== Load Channels ==========
     async function loadPlaylists() {
       const res = await fetch(`${API}/playlists`);
@@ -242,7 +330,10 @@
               ${mediaItems.map(m => `
                 <li draggable="true" data-id="${m.id}" style="padding:10px; margin:6px 0; background:#f0f0f0; border-radius:6px; cursor:grab; display:flex; justify-content:space-between; align-items:center;">
                   <span>${m.title || m.original_filename}</span>
-                  <span style="color:#888; font-size:0.85rem;">ID ${m.id}</span>
+                  <span style="color:#888; font-size:0.85rem;">
+                    ID ${m.id}
+                    <button onclick="removeFromPlaylist(${p.id}, ${m.id})" title="Remove from this channel (stays in the library)">Remove</button>
+                  </span>
                 </li>
               `).join("")}
              </ul>`;
@@ -358,6 +449,18 @@
       const status = document.getElementById(`stream-status-${playlistId}`);
       await fetch(`${API}/playlists/${playlistId}/stop`, { method: "POST" });
       status.innerText = "Stream stopped";
+    }
+
+    // ========== Remove from Channel ==========
+    async function removeFromPlaylist(playlistId, mediaId) {
+      if (!confirm(`Remove media ID ${mediaId} from channel ${playlistId}? It stays in the media library.`)) return;
+
+      const res = await fetch(`${API}/playlists/${playlistId}/media/${mediaId}`, { method: "DELETE" });
+      if (res.ok) {
+        loadPlaylists();
+      } else {
+        alert("Failed to remove from channel");
+      }
     }
 
     // ========== Delete ==========
