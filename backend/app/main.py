@@ -26,7 +26,7 @@ from fastapi.responses import FileResponse
 from app.core.database import engine, Base, get_db
 from app.models.media import Media
 from app.models.playlist import Playlist
-from app.models.playlist import playlist_media
+from app.models.playlist import playlist_media, playlist_audio, CHANNEL_MODES
 from app.models.settings import Settings
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi import status
@@ -65,6 +65,19 @@ def _ensure_media_conversion_columns():
 
 _ensure_media_conversion_columns()
 
+def _ensure_channel_mode_columns():
+    # Existing media is all video; existing channels keep working as "standard".
+    # (The playlist_audio table is new, so create_all above already made it.)
+    media_cols = [c["name"] for c in inspect(engine).get_columns("media")]
+    playlist_cols = [c["name"] for c in inspect(engine).get_columns("playlists")]
+    with engine.begin() as conn:
+        if "kind" not in media_cols:
+            conn.execute(text("ALTER TABLE media ADD COLUMN kind VARCHAR NOT NULL DEFAULT 'video'"))
+        if "mode" not in playlist_cols:
+            conn.execute(text("ALTER TABLE playlists ADD COLUMN mode VARCHAR NOT NULL DEFAULT 'standard'"))
+
+_ensure_channel_mode_columns()
+
 from app.services.convert import Converter, probe as probe_media
 converter = Converter(SessionLocal, Media)
 
@@ -72,11 +85,19 @@ converter = Converter(SessionLocal, Media)
 def playlist_files_loader(playlist_id: int):
     """Returns a function that reads the channel's current files from the DB.
     The stream supervisor calls it on every (re)start, with a fresh session."""
-    def load() -> list[str]:
+    def load() -> dict:
         db = SessionLocal()
         try:
             p = db.query(Playlist).filter(Playlist.id == playlist_id).first()
-            return [m.filepath for m in p.media_items if m.status == "ready"] if p else []
+            if not p:
+                return {"mode": "standard", "video": [], "audio": []}
+            mode = p.mode or "standard"
+            video = [m.filepath for m in p.media_items
+                     if m.status == "ready" and (m.kind or "video") == "video"]
+            audio = ([m.filepath for m in p.audio_items
+                      if m.status == "ready" and m.kind == "audio"]
+                     if mode == "separate_audio" else [])
+            return {"mode": mode, "video": video, "audio": audio}
         finally:
             db.close()
     return load
@@ -168,7 +189,9 @@ os.makedirs(HLS_PATH, exist_ok=True)
 app.mount("/hls", StaticFiles(directory=HLS_PATH), name="hls")
 
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "2048")) * 1024 * 1024
-ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".gif"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".gif"}
+AUDIO_EXTENSIONS = {".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg"}
+ALLOWED_EXTENSIONS = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
 CHUNK_SIZE = 1024 * 1024
 
 def _clean_text(v: str) -> str:
@@ -177,9 +200,19 @@ def _clean_text(v: str) -> str:
         raise ValueError("must not be empty")
     return v
 
+def _check_mode(v):
+    if v is not None and v not in CHANNEL_MODES:
+        raise ValueError(f"mode must be one of: {', '.join(CHANNEL_MODES)}")
+    return v
+
 class PlaylistCreate(BaseModel):
     name: str = Field(max_length=100)
     description: str | None = Field(default=None, max_length=500)
+    mode: str = "standard"
+    @field_validator("mode")
+    @classmethod
+    def _mode(cls, v):
+        return _check_mode(v)
     @field_validator("name")
     @classmethod
     def _name(cls, v):
@@ -188,6 +221,11 @@ class PlaylistUpdate(BaseModel):
     model_config = {"extra": "forbid"}
     name: str | None = Field(default=None, max_length=100)
     description: str | None = Field(default=None, max_length=500)
+    mode: str | None = None
+    @field_validator("mode")
+    @classmethod
+    def _mode(cls, v):
+        return _check_mode(v)
     @field_validator("name")
     @classmethod
     def _name(cls, v):
@@ -204,11 +242,12 @@ def media_public(m: Media) -> dict:
     # Never expose server file paths or stored filenames.
     return {"id": m.id, "title": m.title or m.original_filename,
             "original_filename": m.original_filename, "folder": m.folder,
-            "duration": m.duration, "status": m.status, "error": m.error,
+            "kind": m.kind or "video", "duration": m.duration, "status": m.status, "error": m.error,
             "has_original": bool(m.original_path), "created_at": m.created_at}
 
 def playlist_public(p: Playlist) -> dict:
-    return {"id": p.id, "name": p.name, "description": p.description, "created_at": p.created_at}
+    return {"id": p.id, "name": p.name, "description": p.description,
+            "mode": p.mode or "standard", "created_at": p.created_at}
 
 class ReorderRequest(BaseModel):
     media_ids: List[int]
@@ -218,29 +257,63 @@ class MediaUpdate(BaseModel):
 class FolderRequest(BaseModel):
     folder: str
 
-def next_position(db: Session, playlist_id: int) -> int:
-    current = db.query(func.max(playlist_media.c.position)).filter(
-        playlist_media.c.playlist_id == playlist_id
+def next_position(db: Session, playlist_id: int, table=playlist_media) -> int:
+    current = db.query(func.max(table.c.position)).filter(
+        table.c.playlist_id == playlist_id
     ).scalar()
     return 0 if current is None else current + 1
 
-def append_to_playlist(db: Session, playlist_id: int, media_id: int) -> bool:
-    """Add media to the end of a playlist. Returns False if it was already there."""
+def append_to_playlist(db: Session, playlist_id: int, media_id: int, table=playlist_media) -> bool:
+    """Add media to the end of a channel's video list (or audio list when
+    table=playlist_audio). Returns False if it was already there."""
     exists = db.execute(
-        playlist_media.select().where(
-            (playlist_media.c.playlist_id == playlist_id) & (playlist_media.c.media_id == media_id)
+        table.select().where(
+            (table.c.playlist_id == playlist_id) & (table.c.media_id == media_id)
         )
     ).first()
     if exists:
         return False
     db.execute(
-        playlist_media.insert().values(
+        table.insert().values(
             playlist_id=playlist_id,
             media_id=media_id,
-            position=next_position(db, playlist_id)
+            position=next_position(db, playlist_id, table)
         )
     )
     return True
+
+def reorder_list(db: Session, playlist_id: int, media_ids: list[int], table, what: str):
+    """Only reorder what is already on the list; never add or drop items here."""
+    current = {r[0] for r in db.execute(
+        table.select().with_only_columns(table.c.media_id)
+        .where(table.c.playlist_id == playlist_id))}
+    if len(media_ids) != len(set(media_ids)) or set(media_ids) != current:
+        raise HTTPException(status_code=400,
+                            detail=f"Reorder list must contain exactly the channel's current {what}")
+    # One transaction: delete + re-insert succeed together or not at all.
+    try:
+        db.execute(table.delete().where(table.c.playlist_id == playlist_id))
+        if media_ids:
+            db.execute(table.insert(), [
+                {"playlist_id": playlist_id, "media_id": mid, "position": pos}
+                for pos, mid in enumerate(media_ids)])
+        db.commit()
+    except Exception:
+        db.rollback()
+        log.exception("Reorder failed for channel %s; rolled back", playlist_id)
+        raise HTTPException(status_code=500, detail="Reorder failed; order unchanged")
+
+def restart_if_running(db: Session, playlist: Playlist):
+    """Apply a mode change to a channel that is on air."""
+    if playlist.stream_running:
+        try:
+            start_playlist_stream(playlist.id, playlist_files_loader(playlist.id))
+        except ValueError as e:
+            # Not enough media for the new mode yet; stop rather than keep the old mix.
+            stop_playlist_stream(playlist.id)
+            playlist.stream_running = False
+            db.commit()
+            log.warning("Channel %s stopped after mode change: %s", playlist.id, e)
 
 @app.get("/")
 async def root():
@@ -263,9 +336,11 @@ async def upload_video(
 ):
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="Only MP4, MOV, MKV, WebM and GIF files are allowed")
+        raise HTTPException(status_code=400, detail="Only MP4, MOV, MKV, WebM and GIF video files, "
+                            "or MP3, M4A, AAC, FLAC, WAV and OGG audio files are allowed")
+    kind = "audio" if ext in AUDIO_EXTENSIONS else "video"
     file_id = str(uuid.uuid4())
-    unique_name = f"{file_id}.mp4"              # converted station file
+    unique_name = f"{file_id}.mka" if kind == "audio" else f"{file_id}.mp4"  # converted station file
     upload_name = f"{file_id}.original{ext}"    # as uploaded; removed after conversion unless kept
     folder_name = clean_folder_name(folder)
     folder_dir = os.path.join(MEDIA_PATH, folder_name)
@@ -281,7 +356,7 @@ async def upload_video(
                 if written > MAX_UPLOAD_BYTES:
                     raise HTTPException(status_code=413, detail=f"File is larger than {MAX_UPLOAD_BYTES // (1024*1024)} MB")
                 buffer.write(chunk)
-        duration = probe_media(file_location)["duration"]
+        duration = probe_media(file_location, kind)["duration"]
     except ValueError as e:
         os.remove(file_location)
         raise HTTPException(status_code=400, detail=f"Rejected: {e}")
@@ -297,6 +372,7 @@ async def upload_video(
         filepath=converted_location,
         original_path=file_location,
         folder=folder_name,
+        kind=kind,
         duration=duration,
         status="pending",
     )
@@ -309,6 +385,7 @@ async def upload_video(
         "id": media.id,
         "filename": media.original_filename,
         "folder": media.folder,
+        "kind": media.kind,
         "status": media.status
     }
 
@@ -367,7 +444,7 @@ async def create_playlist(
     db: Session = Depends(get_db),
     username: str = Depends(verify_admin)
 ):
-    db_playlist = Playlist(name=playlist.name, description=playlist.description)
+    db_playlist = Playlist(name=playlist.name, description=playlist.description, mode=playlist.mode)
     db.add(db_playlist)
     db.commit()
     db.refresh(db_playlist)
@@ -388,6 +465,9 @@ async def add_media_to_playlist(
 
     if not playlist or not media:
         raise HTTPException(status_code=404, detail="Playlist or Media not found")
+    if (media.kind or "video") != "video":
+        raise HTTPException(status_code=400, detail="That is an audio track. Add it to a separate-audio "
+                            "channel's audio playlist instead.")
     if media.status != "ready":
         raise HTTPException(status_code=409, detail=f"This video is not ready yet (status: {media.status})")
 
@@ -425,9 +505,10 @@ async def add_folder_to_playlist(
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
     folder_name = clean_folder_name(data.folder)
-    all_items = db.query(Media).filter(Media.folder == folder_name).order_by(Media.id).all()
+    all_items = db.query(Media).filter(Media.folder == folder_name,
+                                       Media.kind == "video").order_by(Media.id).all()
     if not all_items:
-        raise HTTPException(status_code=404, detail="Folder is empty or does not exist")
+        raise HTTPException(status_code=404, detail="Folder has no videos or does not exist")
     media_items = [m for m in all_items if m.status == "ready"]
     added = [m.id for m in media_items if append_to_playlist(db, playlist_id, m.id)]
     db.commit()
@@ -455,9 +536,6 @@ async def start_stream(
     playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
-
-    if not any(m.status == "ready" for m in playlist.media_items):
-        raise HTTPException(status_code=400, detail="Channel has no ready videos")
 
     try:
         start_playlist_stream(playlist_id, playlist_files_loader(playlist_id))
@@ -518,6 +596,7 @@ async def delete_media(
             log.warning("Error deleting file %s: %s", path, e)
 
     db.execute(playlist_media.delete().where(playlist_media.c.media_id == media_id))
+    db.execute(playlist_audio.delete().where(playlist_audio.c.media_id == media_id))
     db.delete(media)
     db.commit()
     return {"status": "deleted", "media_id": media_id}
@@ -552,6 +631,7 @@ async def get_playlist_media(playlist_id: int, db: Session = Depends(get_db),
             "title": m.title or m.original_filename,
             "original_filename": m.original_filename,
             "folder": m.folder,
+            "kind": m.kind or "video",
             "status": m.status
         }
         for m in playlist.media_items
@@ -569,26 +649,82 @@ async def reorder_playlist(
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
 
-    # Only reorder what is already on the channel; never add or drop items here.
-    current = {r[0] for r in db.execute(
-        playlist_media.select().with_only_columns(playlist_media.c.media_id)
-        .where(playlist_media.c.playlist_id == playlist_id))}
-    if len(data.media_ids) != len(set(data.media_ids)) or set(data.media_ids) != current:
-        raise HTTPException(status_code=400,
-                            detail="Reorder list must contain exactly the channel's current videos")
-
-    # One transaction: delete + re-insert succeed together or not at all.
-    try:
-        db.execute(playlist_media.delete().where(playlist_media.c.playlist_id == playlist_id))
-        db.execute(playlist_media.insert(), [
-            {"playlist_id": playlist_id, "media_id": mid, "position": pos}
-            for pos, mid in enumerate(data.media_ids)])
-        db.commit()
-    except Exception:
-        db.rollback()
-        log.exception("Reorder failed for channel %s; rolled back", playlist_id)
-        raise HTTPException(status_code=500, detail="Reorder failed; order unchanged")
+    reorder_list(db, playlist_id, data.media_ids, playlist_media, "videos")
     return {"status": "reordered", "playlist_id": playlist_id}
+
+
+# ---------- Audio playlist (separate_audio channels) ----------
+
+def _audio_channel(db: Session, playlist_id: int) -> Playlist:
+    playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Channel not found")
+    return playlist
+
+@app.get("/playlists/{playlist_id}/audio")
+async def get_playlist_audio(playlist_id: int, db: Session = Depends(get_db),
+                             username: str = Depends(verify_admin)):
+    playlist = _audio_channel(db, playlist_id)
+    return [{"id": m.id, "title": m.title or m.original_filename,
+             "original_filename": m.original_filename, "folder": m.folder,
+             "kind": m.kind, "duration": m.duration, "status": m.status}
+            for m in playlist.audio_items]
+
+# Registered before /audio/{media_id} so "reorder" is not read as a media id.
+@app.post("/playlists/{playlist_id}/audio/reorder")
+async def reorder_playlist_audio(playlist_id: int, data: ReorderRequest,
+                                 db: Session = Depends(get_db),
+                                 username: str = Depends(verify_admin)):
+    _audio_channel(db, playlist_id)
+    reorder_list(db, playlist_id, data.media_ids, playlist_audio, "audio tracks")
+    return {"status": "reordered", "playlist_id": playlist_id}
+
+@app.post("/playlists/{playlist_id}/audio/{media_id}")
+async def add_audio_to_playlist(playlist_id: int, media_id: int, db: Session = Depends(get_db),
+                                username: str = Depends(verify_admin)):
+    playlist = _audio_channel(db, playlist_id)
+    if playlist.mode != "separate_audio":
+        raise HTTPException(status_code=400, detail="This channel plays each video's own sound. "
+                            "Switch it to separate audio mode to give it an audio playlist.")
+    media = db.query(Media).filter(Media.id == media_id).first()
+    if not media:
+        raise HTTPException(status_code=404, detail="Media not found")
+    if media.kind != "audio":
+        raise HTTPException(status_code=400, detail="Only audio tracks can go in the audio playlist")
+    if media.status != "ready":
+        raise HTTPException(status_code=409, detail=f"This track is not ready yet (status: {media.status})")
+    append_to_playlist(db, playlist_id, media_id, playlist_audio)
+    db.commit()
+    return {"status": "added", "playlist_id": playlist_id, "media_id": media_id}
+
+@app.delete("/playlists/{playlist_id}/audio/{media_id}")
+async def remove_audio_from_playlist(playlist_id: int, media_id: int, db: Session = Depends(get_db),
+                                     username: str = Depends(verify_admin)):
+    result = db.execute(playlist_audio.delete().where(
+        (playlist_audio.c.playlist_id == playlist_id) & (playlist_audio.c.media_id == media_id)))
+    db.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="That track is not in this channel's audio playlist")
+    return {"status": "removed", "playlist_id": playlist_id, "media_id": media_id}
+
+@app.post("/playlists/{playlist_id}/audio-folder")
+async def add_audio_folder_to_playlist(playlist_id: int, data: FolderRequest,
+                                       db: Session = Depends(get_db),
+                                       username: str = Depends(verify_admin)):
+    playlist = _audio_channel(db, playlist_id)
+    if playlist.mode != "separate_audio":
+        raise HTTPException(status_code=400, detail="This channel has no audio playlist (standard mode)")
+    folder_name = clean_folder_name(data.folder)
+    all_items = db.query(Media).filter(Media.folder == folder_name,
+                                       Media.kind == "audio").order_by(Media.id).all()
+    if not all_items:
+        raise HTTPException(status_code=404, detail="Folder has no audio tracks or does not exist")
+    ready = [m for m in all_items if m.status == "ready"]
+    added = [m.id for m in ready if append_to_playlist(db, playlist_id, m.id, playlist_audio)]
+    db.commit()
+    return {"status": "added", "playlist_id": playlist_id, "folder": folder_name, "added": added,
+            "skipped": len(ready) - len(added), "not_ready": len(all_items) - len(ready)}
+
 @app.get("/settings")
 async def get_settings(db: Session = Depends(get_db)):
     settings = db.query(Settings).first()
@@ -633,6 +769,13 @@ async def rename_playlist(
         playlist.name = data.name
     if data.description is not None:
         playlist.description = data.description.strip() or None
+    mode_changed = data.mode is not None and data.mode != (playlist.mode or "standard")
+    if mode_changed:
+        # The audio playlist is kept when switching back to standard, so switching
+        # modes back and forth never loses work.
+        playlist.mode = data.mode
     db.commit()
     db.refresh(playlist)
+    if mode_changed:
+        restart_if_running(db, playlist)
     return playlist_public(playlist)
