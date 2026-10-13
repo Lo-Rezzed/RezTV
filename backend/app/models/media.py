@@ -12,4 +12,8 @@ class Media(Base):
     duration = Column(Float, nullable=True)          # in seconds
     filepath = Column(String, nullable=False)
     folder = Column(String, nullable=False, default="Unsorted", server_default="Unsorted")
+    # Conversion: pending -> converting -> ready | failed. Only "ready" media can be streamed.
+    status = Column(String, nullable=False, default="pending", server_default="ready")
+    error = Column(String, nullable=True)
+    original_path = Column(String, nullable=True)   # uploaded file, kept only if KEEP_ORIGINALS
     created_at = Column(DateTime(timezone=True), server_default=func.now())

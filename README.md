@@ -8,13 +8,16 @@ Upload videos, create channels, schedule continuous playout, and share a clean p
 
 ## Features
 
-- Upload and manage video files
+- Upload videos (MP4, MOV, MKV, WebM) and animated GIFs, up to 2 GB each
+- Automatic conversion of every upload to one station format (1080p, 30 fps, H.264/AAC, even volume, silent track added when needed)
+- Media folders, with whole-folder adds to a channel
 - Create multiple channels
 - Drag & drop playlist reordering
-- Continuous HLS streaming
+- Continuous HLS streaming that restarts itself after a crash or server reboot
+- Per-channel status and stream logs in the admin panel
 - Clean public player (`/channel/1`)
 - Custom Station Name
-- Password-protected admin panel
+- Password-protected admin panel with login lockout (no default password)
 - Docker-based installation
 - Fully open source (MIT License)
 

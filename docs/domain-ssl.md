@@ -1,26 +1,34 @@
-Domain Name & SSL Certificate Setup
+# Domain Name & SSL Certificate Setup
+
 This guide shows how to point a domain to your RezTV server and enable free HTTPS.
 
-1. Point your domain to the server
-In your domain registrar’s DNS settings, create an A record:
+## 1. Point your domain to the server
 
-Host / Name: @ (or leave blank) → points to your server IP
-Host / Name: www → points to your server IP
+In your domain registrar's DNS settings, create two A records:
+
+- Host / Name: `@` (or leave blank) → your server IP
+- Host / Name: `www` → your server IP
+
 Wait a few minutes (sometimes up to a few hours) for DNS to update.
 
-2. Install Nginx (Reverse Proxy)
-bash
+## 2. Install nginx (reverse proxy)
+
+```bash
 apt update
 apt install -y nginx
-3. Create Nginx configuration
+```
+
+## 3. Create the nginx configuration
 
 RezTV only listens on `127.0.0.1:8000`, so nginx is the only way in from the internet. Keep the `X-Real-IP` line: login rate limiting uses it to tell visitors apart.
 
-bash
+```bash
 nano /etc/nginx/sites-available/reztv
-Paste the following (replace yourdomain.com with your real domain):
+```
 
-nginx
+Paste the following (replace `yourdomain.com` with your real domain):
+
+```nginx
 server {
     listen 80;
     server_name yourdomain.com www.yourdomain.com;
@@ -41,28 +49,40 @@ server {
         proxy_set_header Connection "upgrade";
     }
 }
+```
+
+`proxy_read_timeout` only covers the upload itself. Conversion happens afterwards in the background, so large files don't need a longer timeout.
+
 Enable the site:
 
-bash
+```bash
 ln -s /etc/nginx/sites-available/reztv /etc/nginx/sites-enabled/
 rm -f /etc/nginx/sites-enabled/default
 nginx -t
 systemctl reload nginx
-4. Install free SSL certificate (Let's Encrypt)
-bash
+```
+
+## 4. Install a free SSL certificate (Let's Encrypt)
+
+```bash
 apt install -y certbot python3-certbot-nginx
 certbot --nginx -d yourdomain.com -d www.yourdomain.com
+```
+
 Follow the prompts:
 
-Enter your email
-Agree to the terms
-Choose option 2 (Redirect HTTP to HTTPS)
-Certbot will automatically configure HTTPS and set up auto-renewal.
+1. Enter your email
+2. Agree to the terms
+3. If asked, choose to redirect HTTP to HTTPS
 
-5. Test
+Certbot configures HTTPS and sets up automatic renewal.
+
+## 5. Test
+
 Visit:
 
-https://yourdomain.com
-https://yourdomain.com/admin
-https://yourdomain.com/channel/1
+- `https://yourdomain.com`
+- `https://yourdomain.com/admin` (asks for the username and password from your `.env`)
+- `https://yourdomain.com/channel/1`
+
 You should see a secure padlock in the browser.

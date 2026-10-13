@@ -42,7 +42,7 @@
   <section>
     <h2>Upload Video</h2>
     <form id="uploadForm">
-      <input type="file" id="videoFile" accept="video/*" required>
+      <input type="file" id="videoFile" accept="video/*,image/gif,.gif,.mkv" required>
       <input type="text" id="uploadFolder" list="folderOptions" placeholder="Folder (optional)">
       <datalist id="folderOptions"></datalist>
       <button type="submit">Upload</button>
@@ -151,11 +151,13 @@
       xhr.addEventListener("load", () => {
         if (xhr.status >= 200 && xhr.status < 300) {
           const data = JSON.parse(xhr.responseText);
-          status.innerHTML = `<span class="success">Successfully uploaded: ${data.filename} (ID: ${data.id}) to ${data.folder}</span>`;
+          status.innerHTML = `<span class="success">Uploaded: ${data.filename} (ID: ${data.id}) to ${data.folder}. Converting to the station format now; it can be added to a channel once it shows "ready".</span>`;
           loadMedia();
           fileInput.value = "";
         } else {
-          status.innerHTML = `<span class="error">Upload failed (${xhr.status})</span>`;
+          let detail = "";
+          try { detail = JSON.parse(xhr.responseText).detail || ""; } catch (_) {}
+          status.innerHTML = `<span class="error">Upload failed (${xhr.status}) ${detail}</span>`;
         }
       });
 
@@ -226,18 +228,27 @@
         return;
       }
 
+      const colors = { ready: "#2a7", pending: "#888", converting: "#c80", failed: "#c00" };
+      const fmt = s => s ? `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}` : "";
+      if (media.some(m => m.status === "pending" || m.status === "converting")) {
+        clearTimeout(window._convPoll);
+        window._convPoll = setTimeout(loadMedia, 5000);
+      }
       list.innerHTML = media.map(m => {
+        const ready = m.status === "ready";
+        const badge = `<span title="${(m.error || "").replace(/"/g, "&quot;")}" style="color:${colors[m.status] || "#888"}; font-weight:bold; font-size:0.85rem;">${m.status}</span>`;
         const options = playlists.map(p => `<option value="${p.id}">${p.name}</option>`).join("");
         return `
           <li>
-            <span>ID ${m.id}: ${m.original_filename || m.filename} <span style="color:#888; font-size:0.85rem;">[${m.folder}]</span></span>
+            <span>ID ${m.id}: ${m.original_filename || m.filename} <span style="color:#888; font-size:0.85rem;">[${m.folder}]</span> ${badge} <span style="color:#888; font-size:0.85rem;">${ready ? fmt(m.duration) : ""}</span>${m.status === "failed" && m.error ? `<br><small style="color:#c00;">${m.error.replace(/</g, "&lt;")}</small>` : ""}</span>
             <div>
               <button onclick="moveMedia(${m.id}, '${m.folder}')">Move</button>
-              <select id="select-${m.id}">
+              ${m.status === "failed" ? `<button onclick="retryConvert(${m.id})">Retry</button>` : ""}
+              <select id="select-${m.id}" ${ready ? "" : "disabled"}>
                 <option value="">Select channel...</option>
                 ${options}
               </select>
-              <button onclick="addToPlaylist(${m.id})">Add</button>
+              <button onclick="addToPlaylist(${m.id})" ${ready ? "" : "disabled title='Available once conversion is ready'"}>Add</button>
               <button onclick="deleteMedia(${m.id})" style="background:#ffdddd; color:#c00;">Delete</button>
             </div>
           </li>
@@ -269,6 +280,15 @@
     }
 
     // ========== Folders ==========
+    async function retryConvert(mediaId) {
+      const res = await fetch(`${API}/media/${mediaId}/convert`, { method: "POST" });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        alert(`Could not retry: ${d.detail || res.status}`);
+      }
+      loadMedia();
+    }
+
     async function moveMedia(mediaId, current) {
       const folder = prompt("Move to folder (type a new name to create one):", current);
       if (folder === null || folder.trim() === "" || folder.trim() === current) return;
@@ -300,7 +320,8 @@
 
       if (res.ok) {
         const skipped = data.skipped ? ` (${data.skipped} already in the channel)` : "";
-        alert(`Added ${data.added.length} videos from ${data.folder} to channel ${playlistId}${skipped}`);
+        const notReady = data.not_ready ? ` ${data.not_ready} not ready yet were left out.` : "";
+        alert(`Added ${data.added.length} videos from ${data.folder} to channel ${playlistId}${skipped}.${notReady}`);
         loadPlaylists();
       } else {
         alert("Failed: " + (data.detail || "Unknown error"));
@@ -336,7 +357,7 @@
           : `<ul class="sortable" data-playlist-id="${p.id}" style="list-style:none; padding:0; margin:12px 0;">
               ${mediaItems.map(m => `
                 <li draggable="true" data-id="${m.id}" style="padding:10px; margin:6px 0; background:#f0f0f0; border-radius:6px; cursor:grab; display:flex; justify-content:space-between; align-items:center;">
-                  <span>${m.title || m.original_filename}</span>
+                  <span>${m.title || m.original_filename}${m.status && m.status !== "ready" ? ` <small style="color:#c00;">(${m.status}, skipped)</small>` : ""}</span>
                   <span style="color:#888; font-size:0.85rem;">
                     ID ${m.id}
                     <button onclick="removeFromPlaylist(${p.id}, ${m.id})" title="Remove from this channel (stays in the library)">Remove</button>
