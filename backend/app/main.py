@@ -12,7 +12,15 @@ import os
 import uuid
 import re
 
-from app.services.hls import start_playlist_stream, stop_playlist_stream
+import logging
+from contextlib import asynccontextmanager
+from app.services.hls import (start_playlist_stream, stop_playlist_stream, stop_all,
+                              stream_status, read_log_tail)
+from app.core.database import SessionLocal
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("reztv")
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from app.core.database import engine, Base, get_db
@@ -36,6 +44,48 @@ def _ensure_media_folder_column():
 
 _ensure_media_folder_column()
 
+def _ensure_playlist_running_column():
+    columns = [c["name"] for c in inspect(engine).get_columns("playlists")]
+    if "stream_running" not in columns:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE playlists ADD COLUMN stream_running BOOLEAN NOT NULL DEFAULT false"))
+
+_ensure_playlist_running_column()
+
+
+def playlist_files_loader(playlist_id: int):
+    """Returns a function that reads the channel's current files from the DB.
+    The stream supervisor calls it on every (re)start, with a fresh session."""
+    def load() -> list[str]:
+        db = SessionLocal()
+        try:
+            p = db.query(Playlist).filter(Playlist.id == playlist_id).first()
+            return [m.filepath for m in p.media_items] if p else []
+        finally:
+            db.close()
+    return load
+
+
+def resume_streams():
+    db = SessionLocal()
+    try:
+        ids = [p.id for p in db.query(Playlist).filter(Playlist.stream_running.is_(True)).all()]
+    finally:
+        db.close()
+    for pid in ids:
+        try:
+            start_playlist_stream(pid, playlist_files_loader(pid))
+            log.info("Resumed channel %s after startup", pid)
+        except ValueError as e:
+            log.warning("Channel %s marked running but could not resume: %s", pid, e)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    resume_streams()
+    yield
+    stop_all()  # stream_running flags stay set, so channels come back on next start
+
 DEFAULT_FOLDER = "Unsorted"
 
 def clean_folder_name(name: str | None) -> str:
@@ -45,7 +95,7 @@ def clean_folder_name(name: str | None) -> str:
     name = re.sub(r"\s+", " ", name).strip()[:64]
     return name or DEFAULT_FOLDER
 
-app = FastAPI(title="RezTV", version="0.1.0")
+app = FastAPI(title="RezTV", version="0.1.0", lifespan=lifespan)
 security = HTTPBasic()
 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
@@ -377,25 +427,45 @@ async def start_stream(
     if not playlist.media_items:
         raise HTTPException(status_code=400, detail="Playlist has no media")
 
-    media_files = [m.filepath for m in playlist.media_items]
-
     try:
-        m3u8_path = start_playlist_stream(playlist_id, media_files)
+        start_playlist_stream(playlist_id, playlist_files_loader(playlist_id))
+        playlist.stream_running = True
+        db.commit()
         return {
             "status": "started",
             "playlist_id": playlist_id,
             "stream_url": f"/hls/playlist_{playlist_id}/index.m3u8"
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except OSError as e:
+        log.exception("Could not start channel %s", playlist_id)
+        raise HTTPException(status_code=500, detail=f"Could not start stream: {e}")
 
 @app.post("/playlists/{playlist_id}/stop")
 async def stop_stream(
     playlist_id: int,
+    db: Session = Depends(get_db),
     username: str = Depends(verify_admin)
 ):
     stop_playlist_stream(playlist_id)
+    playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
+    if playlist:
+        playlist.stream_running = False
+        db.commit()
     return {"status": "stopped", "playlist_id": playlist_id}
+
+
+@app.get("/playlists/{playlist_id}/status")
+async def get_stream_status(playlist_id: int, lines: int = 50,
+                            db: Session = Depends(get_db),
+                            username: str = Depends(verify_admin)):
+    playlist = db.query(Playlist).filter(Playlist.id == playlist_id).first()
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    lines = max(1, min(lines, 500))
+    return {"playlist_id": playlist_id, "should_run": bool(playlist.stream_running),
+            **stream_status(playlist_id), "log": read_log_tail(playlist_id, lines)}
 
 @app.delete("/media/{media_id}")
 async def delete_media(
@@ -411,8 +481,8 @@ async def delete_media(
     try:
         if os.path.exists(media.filepath):
             os.remove(media.filepath)
-    except Exception as e:
-        print(f"Error deleting file: {e}")
+    except OSError as e:
+        log.warning("Error deleting file %s: %s", media.filepath, e)
 
     db.execute(playlist_media.delete().where(playlist_media.c.media_id == media_id))
     db.delete(media)
@@ -465,23 +535,25 @@ async def reorder_playlist(
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
 
-    # Clear existing associations
-    db.execute(
-        playlist_media.delete().where(playlist_media.c.playlist_id == playlist_id)
-    )
-    db.commit()
+    # Only reorder what is already on the channel; never add or drop items here.
+    current = {r[0] for r in db.execute(
+        playlist_media.select().with_only_columns(playlist_media.c.media_id)
+        .where(playlist_media.c.playlist_id == playlist_id))}
+    if len(data.media_ids) != len(set(data.media_ids)) or set(data.media_ids) != current:
+        raise HTTPException(status_code=400,
+                            detail="Reorder list must contain exactly the channel's current videos")
 
-    # Insert them again with correct position
-    for position, media_id in enumerate(data.media_ids):
-        db.execute(
-            playlist_media.insert().values(
-                playlist_id=playlist_id,
-                media_id=media_id,
-                position=position
-            )
-        )
-
-    db.commit()
+    # One transaction: delete + re-insert succeed together or not at all.
+    try:
+        db.execute(playlist_media.delete().where(playlist_media.c.playlist_id == playlist_id))
+        db.execute(playlist_media.insert(), [
+            {"playlist_id": playlist_id, "media_id": mid, "position": pos}
+            for pos, mid in enumerate(data.media_ids)])
+        db.commit()
+    except Exception:
+        db.rollback()
+        log.exception("Reorder failed for channel %s; rolled back", playlist_id)
+        raise HTTPException(status_code=500, detail="Reorder failed; order unchanged")
     return {"status": "reordered", "playlist_id": playlist_id}
 @app.get("/settings")
 async def get_settings(db: Session = Depends(get_db)):
