@@ -52,6 +52,22 @@ def _ensure_playlist_running_column():
 
 _ensure_playlist_running_column()
 
+def _ensure_media_conversion_columns():
+    # Media that existed before conversion was added is treated as ready, as it streamed before.
+    columns = [c["name"] for c in inspect(engine).get_columns("media")]
+    with engine.begin() as conn:
+        if "status" not in columns:
+            conn.execute(text("ALTER TABLE media ADD COLUMN status VARCHAR NOT NULL DEFAULT 'ready'"))
+        if "error" not in columns:
+            conn.execute(text("ALTER TABLE media ADD COLUMN error VARCHAR"))
+        if "original_path" not in columns:
+            conn.execute(text("ALTER TABLE media ADD COLUMN original_path VARCHAR"))
+
+_ensure_media_conversion_columns()
+
+from app.services.convert import Converter, probe as probe_media
+converter = Converter(SessionLocal, Media)
+
 
 def playlist_files_loader(playlist_id: int):
     """Returns a function that reads the channel's current files from the DB.
@@ -60,7 +76,7 @@ def playlist_files_loader(playlist_id: int):
         db = SessionLocal()
         try:
             p = db.query(Playlist).filter(Playlist.id == playlist_id).first()
-            return [m.filepath for m in p.media_items] if p else []
+            return [m.filepath for m in p.media_items if m.status == "ready"] if p else []
         finally:
             db.close()
     return load
@@ -82,6 +98,7 @@ def resume_streams():
 
 @asynccontextmanager
 async def lifespan(app):
+    converter.start()
     resume_streams()
     yield
     stop_all()  # stream_running flags stay set, so channels come back on next start
@@ -144,13 +161,14 @@ app.mount("/static", StaticFiles(directory="app/static"), name="static")
 MEDIA_PATH = os.getenv("MEDIA_PATH", "/app/media")
 HLS_PATH = os.getenv("HLS_PATH", "/app/hls")
 
-app.mount("/hls", StaticFiles(directory=HLS_PATH), name="hls")
-
+# Create folders before mounting: StaticFiles refuses to start if the directory is missing.
 os.makedirs(MEDIA_PATH, exist_ok=True)
 os.makedirs(HLS_PATH, exist_ok=True)
 
+app.mount("/hls", StaticFiles(directory=HLS_PATH), name="hls")
+
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "2048")) * 1024 * 1024
-ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm"}
+ALLOWED_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".gif"}
 CHUNK_SIZE = 1024 * 1024
 
 def _clean_text(v: str) -> str:
@@ -186,24 +204,12 @@ def media_public(m: Media) -> dict:
     # Never expose server file paths or stored filenames.
     return {"id": m.id, "title": m.title or m.original_filename,
             "original_filename": m.original_filename, "folder": m.folder,
-            "duration": m.duration, "created_at": m.created_at}
+            "duration": m.duration, "status": m.status, "error": m.error,
+            "has_original": bool(m.original_path), "created_at": m.created_at}
 
 def playlist_public(p: Playlist) -> dict:
     return {"id": p.id, "name": p.name, "description": p.description, "created_at": p.created_at}
 
-def probe_video(path: str) -> float | None:
-    """Return duration if ffprobe finds a video stream, else raise ValueError."""
-    try:
-        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
-                            "-show_entries", "stream=codec_type:format=duration",
-                            "-of", "default=noprint_wrappers=1", path],
-                           capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        raise ValueError(f"could not check file: {e}")
-    if r.returncode != 0 or "codec_type=video" not in r.stdout:
-        raise ValueError("not a readable video file")
-    m = re.search(r"duration=([0-9.]+)", r.stdout)
-    return float(m.group(1)) if m else None
 class ReorderRequest(BaseModel):
     media_ids: List[int]
 class MediaUpdate(BaseModel):
@@ -257,12 +263,15 @@ async def upload_video(
 ):
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail="Only MP4, MOV, MKV and WebM files are allowed")
-    unique_name = f"{uuid.uuid4()}{ext}"
+        raise HTTPException(status_code=400, detail="Only MP4, MOV, MKV, WebM and GIF files are allowed")
+    file_id = str(uuid.uuid4())
+    unique_name = f"{file_id}.mp4"              # converted station file
+    upload_name = f"{file_id}.original{ext}"    # as uploaded; removed after conversion unless kept
     folder_name = clean_folder_name(folder)
     folder_dir = os.path.join(MEDIA_PATH, folder_name)
     os.makedirs(folder_dir, exist_ok=True)
-    file_location = os.path.join(folder_dir, unique_name)
+    file_location = os.path.join(folder_dir, upload_name)
+    converted_location = os.path.join(folder_dir, unique_name)
 
     written = 0
     try:
@@ -272,7 +281,7 @@ async def upload_video(
                 if written > MAX_UPLOAD_BYTES:
                     raise HTTPException(status_code=413, detail=f"File is larger than {MAX_UPLOAD_BYTES // (1024*1024)} MB")
                 buffer.write(chunk)
-        duration = probe_video(file_location)
+        duration = probe_media(file_location)["duration"]
     except ValueError as e:
         os.remove(file_location)
         raise HTTPException(status_code=400, detail=f"Rejected: {e}")
@@ -285,20 +294,39 @@ async def upload_video(
         filename=unique_name,
         original_filename=file.filename,
         title=file.filename,
-        filepath=file_location,
+        filepath=converted_location,
+        original_path=file_location,
         folder=folder_name,
-        duration=duration
+        duration=duration,
+        status="pending",
     )
     db.add(media)
     db.commit()
     db.refresh(media)
+    converter.enqueue(media.id)
 
     return {
         "id": media.id,
         "filename": media.original_filename,
         "folder": media.folder,
-        "status": "uploaded"
+        "status": media.status
     }
+
+@app.post("/media/{media_id}/convert")
+async def reconvert_media(media_id: int, db: Session = Depends(get_db),
+                          username: str = Depends(verify_admin)):
+    """Retry a failed conversion (the original upload is kept until conversion succeeds)."""
+    media = db.query(Media).filter(Media.id == media_id).first()
+    if not media:
+        raise HTTPException(status_code=404, detail="Media not found")
+    if media.status in ("pending", "converting"):
+        raise HTTPException(status_code=409, detail="Already converting")
+    if not media.original_path or not os.path.exists(media.original_path):
+        raise HTTPException(status_code=400, detail="Original upload is not available to convert again")
+    media.status, media.error = "pending", None
+    db.commit()
+    converter.enqueue(media.id)
+    return media_public(media)
 
 @app.get("/media")
 async def list_media(folder: str | None = None, db: Session = Depends(get_db),
@@ -360,6 +388,8 @@ async def add_media_to_playlist(
 
     if not playlist or not media:
         raise HTTPException(status_code=404, detail="Playlist or Media not found")
+    if media.status != "ready":
+        raise HTTPException(status_code=409, detail=f"This video is not ready yet (status: {media.status})")
 
     append_to_playlist(db, playlist_id, media_id)
     db.commit()
@@ -395,13 +425,15 @@ async def add_folder_to_playlist(
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
     folder_name = clean_folder_name(data.folder)
-    media_items = db.query(Media).filter(Media.folder == folder_name).order_by(Media.id).all()
-    if not media_items:
+    all_items = db.query(Media).filter(Media.folder == folder_name).order_by(Media.id).all()
+    if not all_items:
         raise HTTPException(status_code=404, detail="Folder is empty or does not exist")
+    media_items = [m for m in all_items if m.status == "ready"]
     added = [m.id for m in media_items if append_to_playlist(db, playlist_id, m.id)]
     db.commit()
     return {"status": "added", "playlist_id": playlist_id, "folder": folder_name, "added": added,
-            "skipped": len(media_items) - len(added)}
+            "skipped": len(media_items) - len(added),
+            "not_ready": len(all_items) - len(media_items)}
 
 @app.get("/playlists/{playlist_id}")
 async def get_playlist(playlist_id: int, db: Session = Depends(get_db)):
@@ -424,8 +456,8 @@ async def start_stream(
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
 
-    if not playlist.media_items:
-        raise HTTPException(status_code=400, detail="Playlist has no media")
+    if not any(m.status == "ready" for m in playlist.media_items):
+        raise HTTPException(status_code=400, detail="Channel has no ready videos")
 
     try:
         start_playlist_stream(playlist_id, playlist_files_loader(playlist_id))
@@ -477,12 +509,13 @@ async def delete_media(
     if not media:
         raise HTTPException(status_code=404, detail="Media not found")
 
-    # Delete the actual file
-    try:
-        if os.path.exists(media.filepath):
-            os.remove(media.filepath)
-    except OSError as e:
-        log.warning("Error deleting file %s: %s", media.filepath, e)
+    # Delete the converted file and any kept original
+    for path in (media.filepath, media.original_path):
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except OSError as e:
+            log.warning("Error deleting file %s: %s", path, e)
 
     db.execute(playlist_media.delete().where(playlist_media.c.media_id == media_id))
     db.delete(media)
@@ -518,7 +551,8 @@ async def get_playlist_media(playlist_id: int, db: Session = Depends(get_db),
             "id": m.id,
             "title": m.title or m.original_filename,
             "original_filename": m.original_filename,
-            "folder": m.folder
+            "folder": m.folder,
+            "status": m.status
         }
         for m in playlist.media_items
     ]

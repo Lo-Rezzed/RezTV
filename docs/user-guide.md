@@ -15,10 +15,12 @@
 ## Uploading Videos
 
 1. Go to the **Upload Video** section
-2. Select a video file
+2. Select a video file (MP4, MOV, MKV or WebM) or an animated GIF, up to 2 GB
 3. Optionally type a folder name (or pick an existing one). Leave it blank and the video goes in **Unsorted**
 4. Click **Upload**. A progress bar will show the upload status
-5. After uploading, the video appears in the Media Library under its folder
+5. After uploading, the video appears in the Media Library under its folder with the status **pending**, then **converting**
+6. RezTV converts it to the station format (see [Preparing videos](preparing-videos.md)). The list refreshes itself, and when the status reads **ready** the video shows its length and can be added to a channel
+7. If the status reads **failed**, the reason is shown under the video. Click **Retry**, or delete it and upload a different copy
 
 ## Media Folders
 
@@ -37,6 +39,8 @@
 
 ## Adding Videos to a Channel
 
+Only videos marked **ready** can be added; the dropdown and **Add** button stay greyed out until conversion finishes.
+
 1. In the Media Library, use the dropdown next to a video
 2. Select the channel you want
 3. Click **Add**
@@ -45,7 +49,7 @@ To add a whole folder at once:
 
 1. Click the folder in the **Folders** list
 2. In the bar above the videos, choose a channel and click **Add Folder to Channel**
-3. Every video in that folder is added to the end of the channel. Videos already in the channel are skipped
+3. Every video in that folder is added to the end of the channel. Videos already in the channel, or not ready yet, are skipped. Add the rest later once they're ready
 
 ## Removing a Video from a Channel
 
@@ -84,4 +88,4 @@ Each channel writes its stream log to `logs/channel_<ID>.log` in the RezTV folde
 ## Editing or Deleting
 
 - You can rename a channel with the **Edit Name** button
-- You can delete videos or entire channels with the red **Delete** buttons
+- You can delete videos or entire channels with the red **Delete** buttons. Deleting a video removes its converted file (and the original, if kept) from the server
