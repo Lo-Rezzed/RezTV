@@ -11,6 +11,8 @@ class Media(Base):
     title = Column(String, nullable=True)
     duration = Column(Float, nullable=True)          # in seconds
     filepath = Column(String, nullable=False)
+    # "video" (plays on screen) or "audio" (music for separate-audio channels).
+    kind = Column(String, nullable=False, default="video", server_default="video")
     folder = Column(String, nullable=False, default="Unsorted", server_default="Unsorted")
     # Conversion: pending -> converting -> ready | failed. Only "ready" media can be streamed.
     status = Column(String, nullable=False, default="pending", server_default="ready")

@@ -12,15 +12,16 @@
 2. Click **Save Station Name**
 3. This name will appear on the public landing page and in the video player
 
-## Uploading Videos
+## Uploading Videos and Music
 
-1. Go to the **Upload Video** section
-2. Select a video file (MP4, MOV, MKV or WebM) or an animated GIF, up to 2 GB
+1. Go to the **Upload Video or Audio** section
+2. Select a video file (MP4, MOV, MKV or WebM), an animated GIF, or an audio file (MP3, M4A, AAC, FLAC, WAV or OGG), up to 2 GB
 3. Optionally type a folder name (or pick an existing one). Leave it blank and the video goes in **Unsorted**
 4. Click **Upload**. A progress bar will show the upload status
 5. After uploading, the video appears in the Media Library under its folder with the status **pending**, then **converting**
 6. RezTV converts it to the station format (see [Preparing videos](preparing-videos.md)). The list refreshes itself, and when the status reads **ready** the video shows its length and can be added to a channel
-7. If the status reads **failed**, the reason is shown under the video. Click **Retry**, or delete it and upload a different copy
+7. Audio files are marked **♫ audio** in the Media Library. They are converted to AAC, 44.1 kHz stereo, with the volume evened out, and can only be added to the audio playlist of a channel in **Separate audio** mode
+8. If the status reads **failed**, the reason is shown under the video. Click **Retry**, or delete it and upload a different copy
 
 ## Media Folders
 
@@ -34,10 +35,34 @@
 
 1. Go to the **Create Channel** section
 2. Enter a name for the channel
-3. Click **Create Channel**
-4. The new channel will also appear on the public landing page
+3. Choose how the channel plays sound:
+   - **Standard**: each video plays with its own sound. This is how RezTV has always worked
+   - **Separate audio**: the channel has two playlists, one of videos and one of music. Both loop on their own and RezTV plays them together: the videos are shown muted and the music plays over them. A song keeps playing when the video changes, and a video keeps playing when the song changes
+4. Click **Create Channel**
+5. The new channel will also appear on the public landing page
+
+### Changing a channel's mode
+
+Click **Change Mode** on the channel. Switching to Standard keeps the audio playlist, so you can switch back later without rebuilding it. If the channel is on air it restarts in the new mode straight away. If you switch an on-air channel to Separate audio before it has any music, it stops; add music and click **Start Stream**.
+
+Channels created before this option existed are Standard and keep working as before.
+
+### Which mode should I use?
+
+- Use **Standard** for programs where picture and sound belong together: music videos, edited programs, anything with speech
+- Use **Separate audio** for visual loops and clips with a soundtrack chosen separately. You can add or swap a clip or a song without re-editing anything. The music is not synced to the picture
+
+## Building the Audio Playlist (Separate audio channels)
+
+1. Upload music as described above and wait until it shows **ready**
+2. In the Media Library, choose the channel next to a track (only Separate audio channels are listed) and click **Add**
+3. Or open a folder and click **Add Folder to Channel**: on a Separate audio channel, the folder's videos go to the video playlist and its music to the audio playlist
+4. In the Channels section, the **♫ Audio playlist** appears under the videos. Drag tracks to reorder them and click **Remove** to take one off. As with videos, restart the stream to apply changes
+5. A Separate audio channel needs at least one ready video and one ready track to start
 
 ## Adding Videos to a Channel
+
+Audio tracks can't be added to the video playlist, and videos can't be added to the audio playlist.
 
 Only videos marked **ready** can be added; the dropdown and **Add** button stay greyed out until conversion finishes.
 
@@ -75,6 +100,12 @@ A started channel stays on until you click **Stop Stream**:
 - If the stream crashes, RezTV restarts it automatically. It waits a little longer after each failure in a row (2 s, 4 s, 8 s ... up to 5 minutes) so a broken file can't overload the server.
 - If the server or RezTV restarts, every channel that was on comes back on by itself.
 - Click **Status & Log** under a channel to see whether it's on air, how many times it has restarted, and the last lines of its stream log. That's the first place to look when a channel goes quiet.
+
+Each line of the log starts a run with the channel's mode and how many videos (and audio tracks) it is playing.
+
+## Server load
+
+A channel re-encodes its picture live, which is the main cost. A Separate audio channel uses about the same CPU as a Standard one: it reads one extra audio file and encodes the same single sound track. On a 4-core server, plan on one 1080p channel per core or so. The optional `STREAM_AUDIO_LOUDNORM=true` setting evens out music volume again live; it is off by default because music is already evened out when it is uploaded.
 
 ## Stream logs
 

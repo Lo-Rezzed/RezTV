@@ -40,9 +40,9 @@
 
   <!-- Upload -->
   <section>
-    <h2>Upload Video</h2>
+    <h2>Upload Video or Audio</h2>
     <form id="uploadForm">
-      <input type="file" id="videoFile" accept="video/*,image/gif,.gif,.mkv" required>
+      <input type="file" id="videoFile" accept="video/*,image/gif,.gif,.mkv,audio/*,.mp3,.m4a,.aac,.flac,.wav,.ogg" required>
       <input type="text" id="uploadFolder" list="folderOptions" placeholder="Folder (optional)">
       <datalist id="folderOptions"></datalist>
       <button type="submit">Upload</button>
@@ -54,6 +54,10 @@
   <section>
     <h2>Create Channel</h2>
     <input type="text" id="playlistName" placeholder="Channel name">
+    <select id="playlistMode" title="How the channel plays sound">
+      <option value="standard">Standard: each video plays with its own sound</option>
+      <option value="separate_audio">Separate audio: video playlist + music playlist, played together</option>
+    </select>
     <button onclick="createPlaylist()">Create Channel</button>
     <p id="playlistStatus"></p>
   </section>
@@ -87,6 +91,8 @@
 
   <script>
     const API = "";
+    const MODE_LABELS = { standard: "Standard", separate_audio: "Separate audio" };
+    let channelModes = {};  // channel id -> mode, refreshed by loadMedia/loadPlaylists
 
     // ========== Station Name ==========
     async function loadStationName() {
@@ -177,10 +183,10 @@
       const res = await fetch(`${API}/playlists`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name })
+        body: JSON.stringify({ name, mode: document.getElementById("playlistMode").value })
       });
       const data = await res.json();
-      document.getElementById("playlistStatus").innerHTML = `<span class="success">Created: ${data.name} (ID: ${data.id})</span>`;
+      document.getElementById("playlistStatus").innerHTML = `<span class="success">Created: ${data.name} (ID: ${data.id}, ${MODE_LABELS[data.mode] || data.mode})</span>`;
       document.getElementById("playlistName").value = "";
       loadPlaylists();
       loadMedia();
@@ -205,6 +211,7 @@
       const media = await mediaRes.json();
       const playlists = await playlistsRes.json();
       const folders = await foldersRes.json();
+      playlists.forEach(p => channelModes[p.id] = p.mode);
 
       // Folder sidebar
       if (currentFolder && !folders.some(f => f.name === currentFolder)) currentFolder = "";
@@ -237,18 +244,22 @@
       list.innerHTML = media.map(m => {
         const ready = m.status === "ready";
         const badge = `<span title="${(m.error || "").replace(/"/g, "&quot;")}" style="color:${colors[m.status] || "#888"}; font-weight:bold; font-size:0.85rem;">${m.status}</span>`;
-        const options = playlists.map(p => `<option value="${p.id}">${p.name}</option>`).join("");
+        const isAudio = m.kind === "audio";
+        // Videos can go on any channel; audio tracks only into a separate-audio channel's music list.
+        const targets = isAudio ? playlists.filter(p => p.mode === "separate_audio") : playlists;
+        const options = targets.map(p => `<option value="${p.id}">${p.name}${isAudio ? " (audio playlist)" : ""}</option>`).join("");
+        const kindTag = isAudio ? `<span style="color:#06c; font-size:0.85rem;">&#9835; audio</span>` : "";
         return `
           <li>
-            <span>ID ${m.id}: ${m.original_filename || m.filename} <span style="color:#888; font-size:0.85rem;">[${m.folder}]</span> ${badge} <span style="color:#888; font-size:0.85rem;">${ready ? fmt(m.duration) : ""}</span>${m.status === "failed" && m.error ? `<br><small style="color:#c00;">${m.error.replace(/</g, "&lt;")}</small>` : ""}</span>
+            <span>ID ${m.id}: ${m.original_filename || m.filename} <span style="color:#888; font-size:0.85rem;">[${m.folder}]</span> ${kindTag} ${badge} <span style="color:#888; font-size:0.85rem;">${ready ? fmt(m.duration) : ""}</span>${m.status === "failed" && m.error ? `<br><small style="color:#c00;">${m.error.replace(/</g, "&lt;")}</small>` : ""}</span>
             <div>
               <button onclick="moveMedia(${m.id}, '${m.folder}')">Move</button>
               ${m.status === "failed" ? `<button onclick="retryConvert(${m.id})">Retry</button>` : ""}
               <select id="select-${m.id}" ${ready ? "" : "disabled"}>
-                <option value="">Select channel...</option>
+                <option value="">${isAudio && !targets.length ? "No separate-audio channels" : "Select channel..."}</option>
                 ${options}
               </select>
-              <button onclick="addToPlaylist(${m.id})" ${ready ? "" : "disabled title='Available once conversion is ready'"}>Add</button>
+              <button onclick="addToPlaylist(${m.id}, '${isAudio ? "audio" : "video"}')" ${ready ? "" : "disabled title='Available once conversion is ready'"}>Add</button>
               <button onclick="deleteMedia(${m.id})" style="background:#ffdddd; color:#c00;">Delete</button>
             </div>
           </li>
@@ -257,7 +268,7 @@
     }
 
     // ========== Add to Channel ==========
-    async function addToPlaylist(mediaId) {
+    async function addToPlaylist(mediaId, kind) {
       const select = document.getElementById(`select-${mediaId}`);
       const playlistId = select.value;
 
@@ -266,7 +277,8 @@
         return;
       }
 
-      const res = await fetch(`${API}/playlists/${playlistId}/media/${mediaId}`, {
+      const list = kind === "audio" ? "audio" : "media";
+      const res = await fetch(`${API}/playlists/${playlistId}/${list}/${mediaId}`, {
         method: "POST"
       });
 
@@ -311,21 +323,30 @@
       const playlistId = document.getElementById("folderChannelSelect").value;
       if (!playlistId) return alert("Please select a channel first");
 
-      const res = await fetch(`${API}/playlists/${playlistId}/folder`, {
+      const post = (path) => fetch(`${API}/playlists/${playlistId}/${path}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ folder: currentFolder })
-      });
-      const data = await res.json();
+      }).then(async r => ({ ok: r.ok, status: r.status, data: await r.json() }));
 
-      if (res.ok) {
-        const skipped = data.skipped ? ` (${data.skipped} already in the channel)` : "";
-        const notReady = data.not_ready ? ` ${data.not_ready} not ready yet were left out.` : "";
-        alert(`Added ${data.added.length} videos from ${data.folder} to channel ${playlistId}${skipped}.${notReady}`);
-        loadPlaylists();
-      } else {
-        alert("Failed: " + (data.detail || "Unknown error"));
+      // Videos go to the video playlist; on separate-audio channels, audio tracks
+      // in the folder go to the audio playlist.
+      const results = [["videos", await post("folder")]];
+      if (channelModes[playlistId] === "separate_audio") results.push(["audio tracks", await post("audio-folder")]);
+
+      const lines = [];
+      for (const [what, r] of results) {
+        if (r.ok) {
+          const skipped = r.data.skipped ? ` (${r.data.skipped} already in the channel)` : "";
+          const notReady = r.data.not_ready ? ` ${r.data.not_ready} not ready yet were left out.` : "";
+          lines.push(`Added ${r.data.added.length} ${what} from ${r.data.folder}${skipped}.${notReady}`);
+        } else if (r.status !== 404) {
+          lines.push(`Failed (${what}): ${r.data.detail || "Unknown error"}`);
+        }
       }
+      if (!lines.length) lines.push("Nothing in this folder can be added to that channel.");
+      alert(lines.join("\n"));
+      loadPlaylists();
     }
 
     // ========== Load Channels ==========
@@ -348,13 +369,34 @@
       const fragment = document.createDocumentFragment();
 
       for (const p of playlists) {
-        const mediaRes = await fetch(`${API}/playlists/${p.id}/media`);
-        const mediaItems = await mediaRes.json();
+        channelModes[p.id] = p.mode;
+        const separate = p.mode === "separate_audio";
+        const [mediaItems, audioItems] = await Promise.all([
+          fetch(`${API}/playlists/${p.id}/media`).then(r => r.json()),
+          separate ? fetch(`${API}/playlists/${p.id}/audio`).then(r => r.json()) : Promise.resolve([])
+        ]);
         if (gen !== loadPlaylistsGen) return;
+        const fmt = s => s ? ` <small style="color:#888;">${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}</small>` : "";
+        const audioListHtml = !separate ? "" : `
+          <div style="margin-top:10px;"><strong>&#9835; Audio playlist</strong>
+            <small style="color:#888;">plays continuously over the videos; video sound is muted</small></div>
+          ${audioItems.length === 0
+            ? `<p style="color:#888; margin:10px 0;">No audio tracks yet. Upload music, then add it from the Media Library.</p>`
+            : `<ul class="sortable" data-playlist-id="${p.id}" data-list="audio" style="list-style:none; padding:0; margin:12px 0;">
+              ${audioItems.map(m => `
+                <li draggable="true" data-id="${m.id}" style="padding:10px; margin:6px 0; background:#e8f0fb; border-radius:6px; cursor:grab; display:flex; justify-content:space-between; align-items:center;">
+                  <span>&#9835; ${m.title || m.original_filename}${fmt(m.duration)}${m.status && m.status !== "ready" ? ` <small style="color:#c00;">(${m.status}, skipped)</small>` : ""}</span>
+                  <span style="color:#888; font-size:0.85rem;">
+                    ID ${m.id}
+                    <button onclick="removeAudioFromPlaylist(${p.id}, ${m.id})" title="Remove from this channel's audio playlist (stays in the library)">Remove</button>
+                  </span>
+                </li>
+              `).join("")}
+             </ul>`}`;
 
         const mediaListHtml = mediaItems.length === 0
           ? `<p style="color:#888; margin:10px 0;">No videos in this channel</p>`
-          : `<ul class="sortable" data-playlist-id="${p.id}" style="list-style:none; padding:0; margin:12px 0;">
+          : `<ul class="sortable" data-playlist-id="${p.id}" data-list="video" style="list-style:none; padding:0; margin:12px 0;">
               ${mediaItems.map(m => `
                 <li draggable="true" data-id="${m.id}" style="padding:10px; margin:6px 0; background:#f0f0f0; border-radius:6px; cursor:grab; display:flex; justify-content:space-between; align-items:center;">
                   <span>${m.title || m.original_filename}${m.status && m.status !== "ready" ? ` <small style="color:#c00;">(${m.status}, skipped)</small>` : ""}</span>
@@ -370,12 +412,16 @@
         box.className = "playlist-box";
         box.innerHTML = `
           <div style="display:flex; justify-content:space-between; align-items:center; gap:10px;">
-            <strong>ID ${p.id}: <span id="channel-name-${p.id}">${p.name}</span></strong>
+            <strong>ID ${p.id}: <span id="channel-name-${p.id}">${p.name}</span>
+              <small style="font-weight:normal; color:#555; background:#eee; border-radius:4px; padding:2px 6px;">${MODE_LABELS[p.mode] || p.mode}</small></strong>
             <div>
               <button onclick="editChannelName(${p.id})">Edit Name</button>
+              <button onclick="changeMode(${p.id}, '${p.mode}')">Change Mode</button>
             </div>
           </div>
+          ${separate ? `<div style="margin-top:10px;"><strong>Video playlist</strong></div>` : ""}
           ${mediaListHtml}
+          ${audioListHtml}
           <div style="margin-top: 12px;">
             <button onclick="startStream(${p.id})">Start Stream</button>
             <button onclick="stopStream(${p.id})">Stop Stream</button>
@@ -411,6 +457,29 @@
       } else {
         alert("Failed to rename channel");
       }
+    }
+
+    // ========== Channel Mode ==========
+    async function changeMode(id, current) {
+      const next = current === "separate_audio" ? "standard" : "separate_audio";
+      const msg = next === "separate_audio"
+        ? "Switch to SEPARATE AUDIO? The channel will play its videos muted, with music from its own audio playlist. If it is on air it restarts (it stops if the audio playlist is still empty)."
+        : "Switch to STANDARD? Each video will play with its own sound again. The audio playlist is kept in case you switch back. If it is on air it restarts.";
+      if (!confirm(msg)) return;
+      const res = await fetch(`${API}/playlists/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode: next })
+      });
+      if (!res.ok) alert("Failed to change mode");
+      loadPlaylists();
+      loadMedia();
+    }
+
+    async function removeAudioFromPlaylist(playlistId, mediaId) {
+      if (!confirm(`Remove track ID ${mediaId} from channel ${playlistId}'s audio playlist? It stays in the media library.`)) return;
+      const res = await fetch(`${API}/playlists/${playlistId}/audio/${mediaId}`, { method: "DELETE" });
+      if (res.ok) loadPlaylists(); else alert("Failed to remove from audio playlist");
     }
 
     // ========== Drag & Drop ==========
@@ -455,7 +524,8 @@
       const playlistId = list.dataset.playlistId;
       const mediaIds = [...list.querySelectorAll("li")].map(li => parseInt(li.dataset.id));
 
-      await fetch(`${API}/playlists/${playlistId}/reorder`, {
+      const path = list.dataset.list === "audio" ? "audio/reorder" : "reorder";
+      await fetch(`${API}/playlists/${playlistId}/${path}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ media_ids: mediaIds })

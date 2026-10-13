@@ -20,6 +20,11 @@ BACKOFF_START = float(os.getenv("STREAM_BACKOFF_START", "2"))
 BACKOFF_MAX = float(os.getenv("STREAM_BACKOFF_MAX", "300"))
 STABLE_SECONDS = float(os.getenv("STREAM_STABLE_SECONDS", "60"))
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
+# Separate-audio channels: even out music volume live as well (music is already
+# normalized once on upload, so this is off by default; it costs a little CPU).
+STREAM_AUDIO_LOUDNORM = os.getenv("STREAM_AUDIO_LOUDNORM", "false").strip().lower() in {
+    "1", "true", "yes", "on"}
+STREAM_LOUDNORM_TARGET = float(os.getenv("STATION_LOUDNORM_TARGET", "-16"))
 
 # playlist_id -> _Channel
 running_processes: dict[int, "_Channel"] = {}
@@ -60,23 +65,86 @@ class _RotatingWriter:
             self._f.close()
 
 
-def _build_cmd(concat_file: Path, stream_dir: Path, output_m3u8: Path) -> list[str]:
+_VIDEO_OUT = [
+    "-vf", "fps=30,format=yuv420p",
+    "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+    "-profile:v", "main", "-crf", "22", "-g", "60", "-keyint_min", "60",
+    "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*2)",
+    "-vsync", "cfr",
+]
+_AUDIO_OUT = ["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2"]
+
+
+def _hls_out(stream_dir: Path, output_m3u8: Path) -> list[str]:
     return [
-        FFMPEG_BIN, "-hide_banner", "-loglevel", "warning",
-        "-re", "-f", "concat", "-safe", "0", "-stream_loop", "-1",
-        "-i", str(concat_file),
-        "-vf", "fps=30,format=yuv420p",
-        "-af", "aresample=44100",
-        "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-        "-profile:v", "main", "-crf", "22", "-g", "60", "-keyint_min", "60",
-        "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*2)",
-        "-vsync", "cfr",
-        "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
         "-f", "hls", "-hls_time", "6", "-hls_list_size", "10",
         "-hls_flags", "delete_segments+append_list+omit_endlist+independent_segments",
         "-hls_segment_filename", str(stream_dir / "segment_%03d.ts"),
         str(output_m3u8),
     ]
+
+
+def _build_cmd(concat_file: Path, stream_dir: Path, output_m3u8: Path) -> list[str]:
+    """Standard channel: each video plays with its own sound."""
+    return [
+        FFMPEG_BIN, "-hide_banner", "-loglevel", "warning",
+        "-re", "-f", "concat", "-safe", "0", "-stream_loop", "-1",
+        "-i", str(concat_file),
+        *_VIDEO_OUT,
+        "-af", "aresample=44100",
+        *_AUDIO_OUT,
+        *_hls_out(stream_dir, output_m3u8),
+    ]
+
+
+def _build_separate_audio_cmd(video_concat: Path, audio_concat: Path,
+                              stream_dir: Path, output_m3u8: Path) -> list[str]:
+    """Separate-audio channel: two inputs, each its own endless loop, read in real
+    time. Picture comes from the video list (its sound is dropped), sound from the
+    audio list. The two lists switch items independently, so a song keeps playing
+    across video changes and vice versa."""
+    # Plain resample, no async= padding: the concat input already gives continuous
+    # timestamps, and async=1 was measured to insert ~0.1 s dropouts on loop.
+    af = "aresample=44100"
+    if STREAM_AUDIO_LOUDNORM:
+        af = f"loudnorm=I={STREAM_LOUDNORM_TARGET}:TP=-1.5:LRA=11,{af}"
+    return [
+        FFMPEG_BIN, "-hide_banner", "-loglevel", "warning",
+        "-re", "-f", "concat", "-safe", "0", "-stream_loop", "-1",
+        "-i", str(video_concat),
+        "-re", "-f", "concat", "-safe", "0", "-stream_loop", "-1",
+        "-i", str(audio_concat),
+        "-map", "0:v:0", "-map", "1:a:0",
+        *_VIDEO_OUT,
+        "-af", af,
+        *_AUDIO_OUT,
+        *_hls_out(stream_dir, output_m3u8),
+    ]
+
+
+def _normalize_source(src) -> dict:
+    """get_files may return a plain list (standard channel) or
+    {"mode": ..., "video": [...], "audio": [...]}."""
+    if isinstance(src, dict):
+        return {"mode": src.get("mode") or "standard",
+                "video": list(src.get("video") or []),
+                "audio": list(src.get("audio") or [])}
+    return {"mode": "standard", "video": list(src or []), "audio": []}
+
+
+def _source_problem(src: dict) -> str | None:
+    if not src["video"]:
+        return "Channel has no ready videos"
+    if src["mode"] == "separate_audio" and not src["audio"]:
+        return "Channel has no ready audio tracks"
+    return None
+
+
+def _write_concat(path: Path, files: list[str]):
+    with open(path, "w") as f:
+        for media in files:
+            safe_path = media.replace("'", "'\\''")
+            f.write(f"file '{safe_path}'\n")
 
 
 class _Channel:
@@ -92,7 +160,7 @@ class _Channel:
                                        name=f"stream-{playlist_id}")
 
     # --- process control ---
-    def _prepare(self, media_files: list[str]) -> tuple[Path, Path, Path]:
+    def _prepare(self, src: dict) -> list[str]:
         stream_dir = Path(HLS_PATH) / f"playlist_{self.playlist_id}"
         stream_dir.mkdir(parents=True, exist_ok=True)
         for pattern in ("*.ts", "*.m3u8"):
@@ -103,19 +171,24 @@ class _Channel:
                     pass
                 except OSError as e:
                     log.warning("Could not remove old HLS file %s: %s", f, e)
-        concat_file = stream_dir / "playlist.txt"
-        with open(concat_file, "w") as f:
-            for media in media_files:
-                safe_path = media.replace("'", "'\\''")
-                f.write(f"file '{safe_path}'\n")
-        return concat_file, stream_dir, stream_dir / "index.m3u8"
+        out = stream_dir / "index.m3u8"
+        video_concat = stream_dir / "playlist.txt"
+        _write_concat(video_concat, src["video"])
+        if src["mode"] == "separate_audio":
+            audio_concat = stream_dir / "audio.txt"
+            _write_concat(audio_concat, src["audio"])
+            return _build_separate_audio_cmd(video_concat, audio_concat, stream_dir, out)
+        return _build_cmd(video_concat, stream_dir, out)
 
-    def _spawn(self, media_files: list[str]):
-        concat_file, stream_dir, out = self._prepare(media_files)
+    def _spawn(self, src: dict):
+        cmd = self._prepare(src)
+        extra = (f", {len(src['audio'])} audio tracks"
+                 if src["mode"] == "separate_audio" else "")
         self.logger.write(f"=== {time.strftime('%Y-%m-%d %H:%M:%S')} starting ffmpeg "
-                          f"({len(media_files)} files, restart #{self.restarts}) ===")
+                          f"(mode {src['mode']}: {len(src['video'])} videos{extra}, "
+                          f"restart #{self.restarts}) ===")
         self.process = subprocess.Popen(
-            _build_cmd(concat_file, stream_dir, out),
+            cmd,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE, text=True, errors="replace",
             preexec_fn=os.setsid,
@@ -147,12 +220,13 @@ class _Channel:
         backoff = BACKOFF_START
         while not self.stop_event.is_set():
             try:
-                files = self.get_files()
+                files = _normalize_source(self.get_files())
             except Exception:
                 log.exception("Channel %s: could not load playlist", self.playlist_id)
-                files = []
-            if not files:
-                self.logger.write("Channel has no media; waiting before retry")
+                files = _normalize_source([])
+            problem = _source_problem(files)
+            if problem:
+                self.logger.write(f"{problem}; waiting before retry")
                 self.stop_event.wait(backoff)
                 backoff = min(backoff * 2, BACKOFF_MAX)
                 continue
@@ -193,8 +267,9 @@ class _Channel:
 def start_playlist_stream(playlist_id: int, get_files: Callable[[], list[str]]) -> str:
     """Start (or restart) a supervised stream. get_files is called on every
     (re)start so playlist edits are picked up after a crash."""
-    if not get_files():
-        raise ValueError("No media files provided")
+    problem = _source_problem(_normalize_source(get_files()))
+    if problem:
+        raise ValueError(problem)
     stop_playlist_stream(playlist_id)
     ch = _Channel(playlist_id, get_files)
     with _lock:

@@ -6,9 +6,10 @@ RezTV converts every upload for you, so in most cases you can upload files as th
 
 - **Video:** MP4, MOV, MKV and WebM
 - **Animated GIF:** converted to a video and looped (see below)
+- **Audio (for Separate audio channels):** MP3, M4A, AAC, FLAC, WAV and OGG
 - **Size:** up to 2 GB per file by default (`MAX_UPLOAD_MB` in `.env`)
 
-Every upload is checked with ffprobe first. A file that isn't a readable video is rejected straight away.
+Every upload is checked with ffprobe first. A file that isn't a readable video (or, for audio files, has no readable sound) is rejected straight away.
 
 ## What RezTV does after upload
 
@@ -24,7 +25,9 @@ Once the upload finishes, RezTV converts the file in the background to the stati
 | Silent clips | A silent audio track is added, so the channel's sound never drops out | |
 | GIFs | Looped until they last at least 30 seconds | `GIF_MIN_SECONDS` |
 
-The Media Library shows each video's status:
+Audio files are converted to AAC stereo, 44.1 kHz, 192 kbps, evened out to the same loudness target (`STATION_LOUDNORM`), with cover art and tags removed. They are stored as `.mka` files next to the videos. Conversion is fast: a few seconds per song.
+
+The Media Library shows each file's status:
 
 - **pending:** waiting its turn (one file is converted at a time)
 - **converting:** being converted now

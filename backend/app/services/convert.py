@@ -46,8 +46,9 @@ CONVERT_CRF = os.getenv("CONVERT_CRF", "20")
 CONVERT_TIMEOUT = int(os.getenv("CONVERT_TIMEOUT_SECONDS", "21600"))  # 6 hours
 
 
-def probe(path: str) -> dict:
-    """Return {'has_video', 'has_audio', 'duration'}; raise ValueError if unreadable."""
+def probe(path: str, kind: str = "video") -> dict:
+    """Return {'has_video', 'has_audio', 'duration'}; raise ValueError if unreadable.
+    kind="video" needs a video stream; kind="audio" needs an audio stream."""
     try:
         r = subprocess.run([FFPROBE_BIN, "-v", "error",
                             "-show_entries", "stream=codec_type:format=duration",
@@ -55,12 +56,32 @@ def probe(path: str) -> dict:
                            capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise ValueError(f"could not check file: {e}")
-    if r.returncode != 0 or "codec_type=video" not in r.stdout:
+    if r.returncode != 0:
+        raise ValueError(f"not a readable {kind} file")
+    has_video = "codec_type=video" in r.stdout
+    has_audio = "codec_type=audio" in r.stdout
+    if kind == "audio" and not has_audio:
+        raise ValueError("not a readable audio file")
+    if kind != "audio" and not has_video:
         raise ValueError("not a readable video file")
     m = re.search(r"duration=([0-9.]+)", r.stdout)
-    return {"has_video": True,
-            "has_audio": "codec_type=audio" in r.stdout,
+    return {"has_video": has_video, "has_audio": has_audio,
             "duration": float(m.group(1)) if m else None}
+
+
+def build_audio_command(src: str, dst: str) -> list[str]:
+    """Music for separate-audio channels: AAC, 44.1 kHz stereo, volume evened out.
+    Cover art and other non-audio streams are dropped. Stored in Matroska (.mka):
+    ffmpeg's looping concat input can't rewind a list of audio-only MP4/M4A files,
+    but loops .mka cleanly."""
+    cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y", "-i", src,
+           "-map", "0:a:0", "-vn", "-sn", "-dn", "-map_metadata", "-1"]
+    af = "aresample=44100"
+    if LOUDNORM:
+        af = f"loudnorm=I={LOUDNORM_TARGET}:TP=-1.5:LRA=11,aresample=44100"
+    cmd += ["-af", af, "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+            "-f", "matroska", dst]
+    return cmd
 
 
 def build_command(src: str, dst: str, info: dict, is_gif: bool) -> list[str]:
@@ -142,7 +163,8 @@ class Converter:
             for k, v in fields.items():
                 setattr(m, k, v)
             db.commit()
-            return {"src": m.original_path, "dst": m.filepath}
+            return {"src": m.original_path, "dst": m.filepath,
+                    "kind": getattr(m, "kind", None) or "video"}
         finally:
             db.close()
 
@@ -154,17 +176,21 @@ class Converter:
         if not src or not os.path.exists(src):
             self._set(mid, status="failed", error="original upload is missing")
             return
-        tmp = dst + ".part.mp4"
+        kind = paths["kind"]
+        tmp = dst + (".part.mka" if kind == "audio" else ".part.mp4")
         try:
-            info = probe(src)
-            is_gif = src.lower().endswith(".gif")
-            cmd = build_command(src, tmp, info, is_gif)
+            info = probe(src, kind)
+            if kind == "audio":
+                cmd = build_audio_command(src, tmp)
+            else:
+                is_gif = src.lower().endswith(".gif")
+                cmd = build_command(src, tmp, info, is_gif)
             log.info("Converting media %s: %s", mid, " ".join(cmd))
             r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                                timeout=CONVERT_TIMEOUT)
             if r.returncode != 0:
                 raise ValueError((r.stderr or "ffmpeg failed").strip()[-500:])
-            out = probe(tmp)
+            out = probe(tmp, kind)
             os.replace(tmp, dst)
         except (ValueError, OSError, subprocess.TimeoutExpired) as e:
             if os.path.exists(tmp):
