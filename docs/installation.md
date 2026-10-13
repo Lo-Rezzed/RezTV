@@ -58,7 +58,14 @@ docker compose up -d --build
 docker compose ps        # both reztv-db and reztv-backend should be "running"
 ```
 
-Open `http://your-server-ip:8000/admin`. To put RezTV on your own domain with HTTPS, follow [Domain & SSL](domain-ssl.md).
+RezTV only listens on the server itself (`127.0.0.1:8000`), so it is not reachable from the internet until you set up nginx. Follow [Domain & SSL](domain-ssl.md) to put it on your domain with HTTPS, then open `https://yourdomain.com/admin`. To test before nginx is set up, use an SSH tunnel from your own computer: `ssh -L 8000:localhost:8000 root@your-server-ip`, then open `http://localhost:8000/admin`.
+
+## Security settings
+
+- RezTV will not start if `ADMIN_PASSWORD` is missing (there is no default password).
+- After 5 wrong logins from one address within 15 minutes, that address is locked out for 15 minutes. Change with `LOGIN_MAX_FAILURES` and `LOGIN_WINDOW_SECONDS` in `.env`.
+- Uploads: MP4, MOV, MKV and WebM only, up to 2 GB by default. Change the limit with `MAX_UPLOAD_MB` in `.env` (and `client_max_body_size` in nginx to match). Every upload is checked with ffprobe and rejected if it isn't a readable video.
+- The media library list is only visible to the admin and never shows server file paths.
 
 ## Updating
 
@@ -66,3 +73,5 @@ Open `http://your-server-ip:8000/admin`. To put RezTV on your own domain with HT
 git pull
 docker compose up -d --build
 ```
+
+Code changes only take effect after the rebuild (the server no longer auto-reloads code). Channels need **Start Stream** pressed again after an update.
