@@ -11,3 +11,4 @@ __pycache__/
 postgres_data/
 __pycache__/
 .pytest_cache/
+backups/

@@ -32,10 +32,12 @@ services:
       STATION_LOUDNORM_TARGET: ${STATION_LOUDNORM_TARGET:--16}
       GIF_MIN_SECONDS: ${GIF_MIN_SECONDS:-30}
       KEEP_ORIGINALS: ${KEEP_ORIGINALS:-false}
+      BACKUP_PATH: /app/backups
     volumes:
       - ./media:/app/media
       - ./hls:/app/hls
       - ./logs:/app/logs
+      - ./backups:/app/backups
     depends_on:
       - db
     restart: unless-stopped
