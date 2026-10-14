@@ -9,3 +9,5 @@ __pycache__/
 
 # Docker volumes
 postgres_data/
+__pycache__/
+.pytest_cache/

@@ -80,6 +80,8 @@ Every upload is converted to one station format so channels play smoothly. The d
 | `STATION_LOUDNORM_TARGET` | `-16` | Loudness target in LUFS |
 | `GIF_MIN_SECONDS` | `30` | Short GIFs loop until they last this long |
 | `KEEP_ORIGINALS` | `false` | `true` keeps each original upload as well as the converted file |
+| `CONVERT_SKIP_MATCHING` | `true` | Uploads already in the station format are copied, not re-encoded |
+| `CONVERT_FPS_TOLERANCE` | `0.05` | How close the frame rate must be to `STATION_FPS` to skip re-encoding |
 
 Pick these once, before you upload. Changes only apply to new uploads. See [Preparing videos](preparing-videos.md) for details.
 

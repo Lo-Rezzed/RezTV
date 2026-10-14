@@ -38,6 +38,7 @@
 3. Choose how the channel plays sound:
    - **Standard**: each video plays with its own sound. This is how RezTV has always worked
    - **Separate audio**: the channel has two playlists, one of videos and one of music. Both loop on their own and RezTV plays them together: the videos are shown muted and the music plays over them. A song keeps playing when the video changes, and a video keeps playing when the song changes
+   - **Mixed**: the channel alternates between finished programs and filler blocks: program 1, then a filler block, then program 2, then a filler block, and so on. Programs are the channel's video playlist and play with their own sound. A filler block shuffles the ready videos from one media folder (the **filler clips folder**), muted, with the channel's audio playlist playing over them, for a set time (**filler block length**, default 30 minutes). Set both when you create the channel, or later with **Filler Settings**
 4. Click **Create Channel**
 5. The new channel will also appear on the public landing page
 
@@ -47,12 +48,15 @@ Click **Change Mode** on the channel. Switching to Standard keeps the audio play
 
 Channels created before this option existed are Standard and keep working as before.
 
+On a **Mixed** channel: with no filler folder (or no music) set, programs play back to back; with no programs, it plays filler blocks only. Changing the filler settings of an on-air Mixed channel restarts it. Viewers keep watching across each switch between a program and a filler block; the player just moves on to the next part.
+
 ### Which mode should I use?
 
 - Use **Standard** for programs where picture and sound belong together: music videos, edited programs, anything with speech
 - Use **Separate audio** for visual loops and clips with a soundtrack chosen separately. You can add or swap a clip or a song without re-editing anything. The music is not synced to the picture
+- Use **Mixed** when you have a few edited programs and a pool of loose clips and music: the programs keep their exact edit and sound, and new clips dropped into the filler folder show up in the next filler block without re-editing anything
 
-## Building the Audio Playlist (Separate audio channels)
+## Building the Audio Playlist (Separate audio and Mixed channels)
 
 1. Upload music as described above and wait until it shows **ready**
 2. In the Media Library, choose the channel next to a track (only Separate audio channels are listed) and click **Add**

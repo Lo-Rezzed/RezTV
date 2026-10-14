@@ -4,6 +4,7 @@ Every upload is re-encoded once, right after it is accepted, to one format so th
 channel stream never meets a file it can't join: same size, frame rate, codecs and
 audio layout. Settings come from environment variables (see .env.example).
 """
+import json
 import logging
 import math
 import os
@@ -44,6 +45,10 @@ KEEP_ORIGINALS = _bool("KEEP_ORIGINALS", False)
 CONVERT_PRESET = os.getenv("CONVERT_PRESET", "veryfast")
 CONVERT_CRF = os.getenv("CONVERT_CRF", "20")
 CONVERT_TIMEOUT = int(os.getenv("CONVERT_TIMEOUT_SECONDS", "21600"))  # 6 hours
+# Uploads that already match the station format (MP4, H.264 yuv420p, AAC, station
+# size and frame rate) are only remuxed (stream copy + faststart), not re-encoded.
+SKIP_MATCHING = _bool("CONVERT_SKIP_MATCHING", True)
+FPS_TOLERANCE = float(os.getenv("CONVERT_FPS_TOLERANCE", "0.05"))
 
 
 def probe(path: str, kind: str = "video") -> dict:
@@ -67,6 +72,102 @@ def probe(path: str, kind: str = "video") -> dict:
     m = re.search(r"duration=([0-9.]+)", r.stdout)
     return {"has_video": has_video, "has_audio": has_audio,
             "duration": float(m.group(1)) if m else None}
+
+
+def _rate(v) -> float | None:
+    try:
+        if isinstance(v, str) and "/" in v:
+            n, d = v.split("/", 1)
+            return float(n) / float(d) if float(d) else None
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def probe_streams(path: str) -> dict:
+    """Detailed ffprobe output (format + streams) as a dict; {} if it fails."""
+    try:
+        r = subprocess.run([FFPROBE_BIN, "-v", "error", "-show_format", "-show_streams",
+                            "-of", "json", path], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if r.returncode != 0:
+        return {}
+    try:
+        return json.loads(r.stdout or "{}")
+    except ValueError:
+        return {}
+
+
+def station_match(details: dict, src: str) -> tuple[bool, str]:
+    """Decide whether an upload already matches the station format.
+    Returns (matches, reason); reason explains the first mismatch for the log."""
+    v_ok, a_ok, why = station_check(details, src)
+    return v_ok and a_ok, why
+
+
+def station_check(details: dict, src: str) -> tuple[bool, bool, str]:
+    """Returns (video_ok, audio_ok, reason). video_ok means the picture can be
+    stream-copied; audio_ok means the sound can be copied too."""
+    if src.lower().endswith(".gif"):
+        return False, False, "GIF"
+    fmt = (details.get("format") or {}).get("format_name") or ""
+    if "mp4" not in fmt.split(",") and "mov" not in fmt.split(","):
+        return False, False, f"container {fmt or 'unknown'}"
+    if not src.lower().endswith((".mp4", ".m4v", ".mov")):
+        return False, False, "not an .mp4/.mov file"
+    streams = details.get("streams") or []
+    vids = [s for s in streams if s.get("codec_type") == "video"
+            and not (s.get("disposition") or {}).get("attached_pic")]
+    auds = [s for s in streams if s.get("codec_type") == "audio"]
+    if len(vids) != 1:
+        return False, False, f"{len(vids)} video streams"
+    v = vids[0]
+    if v.get("codec_name") != "h264":
+        return False, False, f"video codec {v.get('codec_name')}"
+    if v.get("pix_fmt") != "yuv420p":
+        return False, False, f"pixel format {v.get('pix_fmt')}"
+    if (v.get("width"), v.get("height")) != (WIDTH, HEIGHT):
+        return False, False, f"size {v.get('width')}x{v.get('height')} (station {WIDTH}x{HEIGHT})"
+    sar = v.get("sample_aspect_ratio")
+    if sar not in (None, "", "1:1", "0:1", "N/A"):
+        return False, False, f"sample aspect ratio {sar}"
+    fps = _rate(v.get("avg_frame_rate")) or _rate(v.get("r_frame_rate"))
+    if not fps or abs(fps - FPS) > FPS_TOLERANCE:
+        return False, False, f"frame rate {fps} (station {FPS})"
+    # The stream needs every file to have one stereo 44.1 kHz AAC track, the
+    # layout the converter produces (silent videos get a silent track).
+    if len(auds) != 1:
+        return True, False, f"{len(auds)} audio streams"
+    a = auds[0]
+    if a.get("codec_name") != "aac":
+        return True, False, f"audio codec {a.get('codec_name')}"
+    if str(a.get("sample_rate")) != "44100" or int(a.get("channels") or 0) != 2:
+        return True, False, f"audio {a.get('sample_rate')} Hz / {a.get('channels')} ch (station 44100 Hz stereo)"
+    return True, True, "matches station format"
+
+
+def build_remux_command(src: str, dst: str) -> list[str]:
+    """Stream copy into MP4 with the index at the front; no re-encode."""
+    return [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y", "-i", src,
+            "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-sn", "-dn",
+            "-movflags", "+faststart", dst]
+
+
+def build_audio_fix_command(src: str, dst: str, info: dict) -> list[str]:
+    """Picture already matches: copy it, and only (re)make the sound track
+    (resample/normalize, or add silence when there is none). Takes seconds."""
+    cmd = [FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y", "-i", src]
+    if not info["has_audio"]:
+        cmd += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100"]
+    cmd += ["-map", "0:v:0", "-map", "0:a:0" if info["has_audio"] else "1:a:0", "-c:v", "copy"]
+    if info["has_audio"] and LOUDNORM:
+        cmd += ["-af", f"loudnorm=I={LOUDNORM_TARGET}:TP=-1.5:LRA=11,aresample=44100"]
+    cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2", "-sn", "-dn",
+            "-movflags", "+faststart"]
+    if not info["has_audio"]:
+        cmd += ["-shortest"]
+    return cmd + [dst]
 
 
 def build_audio_command(src: str, dst: str) -> list[str]:
@@ -184,7 +285,18 @@ class Converter:
                 cmd = build_audio_command(src, tmp)
             else:
                 is_gif = src.lower().endswith(".gif")
-                cmd = build_command(src, tmp, info, is_gif)
+                v_ok, a_ok, why = (station_check(probe_streams(src), src) if SKIP_MATCHING
+                                   else (False, False, "skip disabled (CONVERT_SKIP_MATCHING=false)"))
+                if v_ok and a_ok:
+                    log.info("Media %s already matches station format; remuxing only", mid)
+                    cmd = build_remux_command(src, tmp)
+                elif v_ok:
+                    log.info("Media %s picture matches station format; copying video, "
+                             "converting audio only: %s", mid, why)
+                    cmd = build_audio_fix_command(src, tmp, info)
+                else:
+                    log.info("Media %s needs re-encode: %s", mid, why)
+                    cmd = build_command(src, tmp, info, is_gif)
             log.info("Converting media %s: %s", mid, " ".join(cmd))
             r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                                timeout=CONVERT_TIMEOUT)

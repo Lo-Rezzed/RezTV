@@ -78,6 +78,17 @@ def _ensure_channel_mode_columns():
 
 _ensure_channel_mode_columns()
 
+def _ensure_mixed_mode_columns():
+    # Mixed mode settings. Existing channels get NULL / 30 and are unaffected.
+    playlist_cols = [c["name"] for c in inspect(engine).get_columns("playlists")]
+    with engine.begin() as conn:
+        if "filler_folder" not in playlist_cols:
+            conn.execute(text("ALTER TABLE playlists ADD COLUMN filler_folder VARCHAR"))
+        if "filler_minutes" not in playlist_cols:
+            conn.execute(text("ALTER TABLE playlists ADD COLUMN filler_minutes INTEGER NOT NULL DEFAULT 30"))
+
+_ensure_mixed_mode_columns()
+
 from app.services.convert import Converter, probe as probe_media
 converter = Converter(SessionLocal, Media)
 
@@ -96,8 +107,14 @@ def playlist_files_loader(playlist_id: int):
                      if m.status == "ready" and (m.kind or "video") == "video"]
             audio = ([m.filepath for m in p.audio_items
                       if m.status == "ready" and m.kind == "audio"]
-                     if mode == "separate_audio" else [])
-            return {"mode": mode, "video": video, "audio": audio}
+                     if mode in ("separate_audio", "mixed") else [])
+            filler = []
+            if mode == "mixed" and p.filler_folder:
+                filler = [m.filepath for m in db.query(Media).filter(
+                    Media.folder == p.filler_folder, Media.kind == "video",
+                    Media.status == "ready").order_by(Media.id)]
+            return {"mode": mode, "video": video, "audio": audio, "filler": filler,
+                    "filler_seconds": (p.filler_minutes or 30) * 60}
         finally:
             db.close()
     return load
@@ -209,6 +226,8 @@ class PlaylistCreate(BaseModel):
     name: str = Field(max_length=100)
     description: str | None = Field(default=None, max_length=500)
     mode: str = "standard"
+    filler_folder: str | None = Field(default=None, max_length=100)
+    filler_minutes: int = Field(default=30, ge=1, le=720)
     @field_validator("mode")
     @classmethod
     def _mode(cls, v):
@@ -222,6 +241,8 @@ class PlaylistUpdate(BaseModel):
     name: str | None = Field(default=None, max_length=100)
     description: str | None = Field(default=None, max_length=500)
     mode: str | None = None
+    filler_folder: str | None = Field(default=None, max_length=100)
+    filler_minutes: int | None = Field(default=None, ge=1, le=720)
     @field_validator("mode")
     @classmethod
     def _mode(cls, v):
@@ -247,7 +268,8 @@ def media_public(m: Media) -> dict:
 
 def playlist_public(p: Playlist) -> dict:
     return {"id": p.id, "name": p.name, "description": p.description,
-            "mode": p.mode or "standard", "created_at": p.created_at}
+            "mode": p.mode or "standard", "filler_folder": p.filler_folder,
+            "filler_minutes": p.filler_minutes or 30, "created_at": p.created_at}
 
 class ReorderRequest(BaseModel):
     media_ids: List[int]
@@ -444,7 +466,10 @@ async def create_playlist(
     db: Session = Depends(get_db),
     username: str = Depends(verify_admin)
 ):
-    db_playlist = Playlist(name=playlist.name, description=playlist.description, mode=playlist.mode)
+    db_playlist = Playlist(name=playlist.name, description=playlist.description, mode=playlist.mode,
+                           filler_folder=clean_folder_name(playlist.filler_folder)
+                           if playlist.filler_folder else None,
+                           filler_minutes=playlist.filler_minutes)
     db.add(db_playlist)
     db.commit()
     db.refresh(db_playlist)
@@ -683,9 +708,9 @@ async def reorder_playlist_audio(playlist_id: int, data: ReorderRequest,
 async def add_audio_to_playlist(playlist_id: int, media_id: int, db: Session = Depends(get_db),
                                 username: str = Depends(verify_admin)):
     playlist = _audio_channel(db, playlist_id)
-    if playlist.mode != "separate_audio":
+    if playlist.mode not in ("separate_audio", "mixed"):
         raise HTTPException(status_code=400, detail="This channel plays each video's own sound. "
-                            "Switch it to separate audio mode to give it an audio playlist.")
+                            "Switch it to separate audio or mixed mode to give it an audio playlist.")
     media = db.query(Media).filter(Media.id == media_id).first()
     if not media:
         raise HTTPException(status_code=404, detail="Media not found")
@@ -712,7 +737,7 @@ async def add_audio_folder_to_playlist(playlist_id: int, data: FolderRequest,
                                        db: Session = Depends(get_db),
                                        username: str = Depends(verify_admin)):
     playlist = _audio_channel(db, playlist_id)
-    if playlist.mode != "separate_audio":
+    if playlist.mode not in ("separate_audio", "mixed"):
         raise HTTPException(status_code=400, detail="This channel has no audio playlist (standard mode)")
     folder_name = clean_folder_name(data.folder)
     all_items = db.query(Media).filter(Media.folder == folder_name,
@@ -770,12 +795,21 @@ async def rename_playlist(
     if data.description is not None:
         playlist.description = data.description.strip() or None
     mode_changed = data.mode is not None and data.mode != (playlist.mode or "standard")
+    filler_changed = False
+    if data.filler_folder is not None:
+        new_folder = clean_folder_name(data.filler_folder) if data.filler_folder.strip() else None
+        if new_folder != playlist.filler_folder:
+            playlist.filler_folder = new_folder
+            filler_changed = True
+    if data.filler_minutes is not None and data.filler_minutes != playlist.filler_minutes:
+        playlist.filler_minutes = data.filler_minutes
+        filler_changed = True
     if mode_changed:
         # The audio playlist is kept when switching back to standard, so switching
         # modes back and forth never loses work.
         playlist.mode = data.mode
     db.commit()
     db.refresh(playlist)
-    if mode_changed:
+    if mode_changed or (filler_changed and playlist.mode == "mixed"):
         restart_if_running(db, playlist)
     return playlist_public(playlist)

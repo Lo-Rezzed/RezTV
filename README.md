@@ -10,7 +10,8 @@ Upload videos, create channels, schedule continuous playout, and share a clean p
 
 - Upload videos (MP4, MOV, MKV, WebM) and animated GIFs, up to 2 GB each
 - Upload music (MP3, M4A, AAC, FLAC, WAV, OGG) for channels with a separate audio playlist
-- Two channel modes: **Standard** (each video plays with its own sound) or **Separate audio** (a video playlist and a music playlist that loop independently and play together)
+- Three channel modes: **Standard** (each video plays with its own sound), **Separate audio** (a video playlist and a music playlist that loop independently and play together) or **Mixed** (finished programs alternating with filler blocks of shuffled clips under music)
+- Uploads already in the station format skip re-encoding
 - Automatic conversion of every upload to one station format (1080p, 30 fps, H.264/AAC, even volume, silent track added when needed)
 - Media folders, with whole-folder adds to a channel
 - Create multiple channels
@@ -55,6 +56,16 @@ RezTV only listens on the server itself (`127.0.0.1:8000`), so it is not reachab
 - [User guide](docs/user-guide.md)
 - [VPS recommendations](docs/vps-recommendations.md)
 - [Disclaimer](docs/disclaimer.md)
+
+## Tests
+
+```bash
+cd backend
+pip install -r requirements.txt pytest
+pytest
+```
+
+The conversion tests need `ffmpeg` and `ffprobe` installed.
 
 ## License
 

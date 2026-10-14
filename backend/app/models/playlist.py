@@ -21,7 +21,8 @@ playlist_audio = Table(
     Column("position", Integer)
 )
 
-CHANNEL_MODES = ("standard", "separate_audio")
+CHANNEL_MODES = ("standard", "separate_audio", "mixed")
+DEFAULT_FILLER_MINUTES = 30
 
 class Playlist(Base):
     __tablename__ = "playlists"
@@ -33,7 +34,13 @@ class Playlist(Base):
     stream_running = Column(Boolean, nullable=False, default=False, server_default='false')
     # "standard": each video plays with its own sound.
     # "separate_audio": video playlist and audio playlist loop independently, mixed live.
+    # "mixed": alternates one video from the video playlist (a rendered program with
+    #   its own sound) with a filler block: shuffled clips from filler_folder, muted,
+    #   under the audio playlist, for filler_minutes. Then the next program, and so on.
     mode = Column(String, nullable=False, default="standard", server_default="standard")
+    filler_folder = Column(String, nullable=True)
+    filler_minutes = Column(Integer, nullable=False, default=DEFAULT_FILLER_MINUTES,
+                            server_default=str(DEFAULT_FILLER_MINUTES))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     media_items = relationship(
