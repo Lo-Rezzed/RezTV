@@ -89,6 +89,22 @@ def _ensure_mixed_mode_columns():
 
 _ensure_mixed_mode_columns()
 
+def _ensure_overlay_and_backup_columns():
+    # On-screen info toggle (default on) and backup schedule (default off).
+    playlist_cols = [c["name"] for c in inspect(engine).get_columns("playlists")]
+    settings_cols = [c["name"] for c in inspect(engine).get_columns("settings")]
+    with engine.begin() as conn:
+        if "show_overlay" not in playlist_cols:
+            conn.execute(text("ALTER TABLE playlists ADD COLUMN show_overlay BOOLEAN NOT NULL DEFAULT true"))
+        if "backup_interval_hours" not in settings_cols:
+            conn.execute(text("ALTER TABLE settings ADD COLUMN backup_interval_hours INTEGER NOT NULL DEFAULT 0"))
+        if "backup_keep" not in settings_cols:
+            conn.execute(text("ALTER TABLE settings ADD COLUMN backup_keep INTEGER NOT NULL DEFAULT 7"))
+        if "backup_include_media" not in settings_cols:
+            conn.execute(text("ALTER TABLE settings ADD COLUMN backup_include_media BOOLEAN NOT NULL DEFAULT true"))
+
+_ensure_overlay_and_backup_columns()
+
 from app.services.convert import Converter, probe as probe_media
 converter = Converter(SessionLocal, Media)
 
@@ -103,17 +119,25 @@ def playlist_files_loader(playlist_id: int):
             if not p:
                 return {"mode": "standard", "video": [], "audio": []}
             mode = p.mode or "standard"
-            video = [m.filepath for m in p.media_items
-                     if m.status == "ready" and (m.kind or "video") == "video"]
-            audio = ([m.filepath for m in p.audio_items
-                      if m.status == "ready" and m.kind == "audio"]
-                     if mode in ("separate_audio", "mixed") else [])
-            filler = []
+            meta = lambda m: {"id": m.id, "title": m.title or m.original_filename,
+                              "duration": m.duration}
+            video_m = [m for m in p.media_items
+                       if m.status == "ready" and (m.kind or "video") == "video"]
+            audio_m = ([m for m in p.audio_items if m.status == "ready" and m.kind == "audio"]
+                       if mode in ("separate_audio", "mixed") else [])
+            filler_m = []
             if mode == "mixed" and p.filler_folder:
-                filler = [m.filepath for m in db.query(Media).filter(
+                filler_m = db.query(Media).filter(
                     Media.folder == p.filler_folder, Media.kind == "video",
-                    Media.status == "ready").order_by(Media.id)]
-            return {"mode": mode, "video": video, "audio": audio, "filler": filler,
+                    Media.status == "ready").order_by(Media.id).all()
+            return {"mode": mode,
+                    "video": [m.filepath for m in video_m],
+                    "audio": [m.filepath for m in audio_m],
+                    "filler": [m.filepath for m in filler_m],
+                    "video_meta": [meta(m) for m in video_m],
+                    "audio_meta": [meta(m) for m in audio_m],
+                    "filler_meta": [meta(m) for m in filler_m],
+                    "overlay": p.show_overlay is not False,
                     "filler_seconds": (p.filler_minutes or 30) * 60}
         finally:
             db.close()
@@ -138,7 +162,9 @@ def resume_streams():
 async def lifespan(app):
     converter.start()
     resume_streams()
+    backup_scheduler.start()
     yield
+    backup_scheduler.stop()
     stop_all()  # stream_running flags stay set, so channels come back on next start
 
 DEFAULT_FOLDER = "Unsorted"
@@ -228,6 +254,7 @@ class PlaylistCreate(BaseModel):
     mode: str = "standard"
     filler_folder: str | None = Field(default=None, max_length=100)
     filler_minutes: int = Field(default=30, ge=1, le=720)
+    show_overlay: bool = True
     @field_validator("mode")
     @classmethod
     def _mode(cls, v):
@@ -243,6 +270,7 @@ class PlaylistUpdate(BaseModel):
     mode: str | None = None
     filler_folder: str | None = Field(default=None, max_length=100)
     filler_minutes: int | None = Field(default=None, ge=1, le=720)
+    show_overlay: bool | None = None
     @field_validator("mode")
     @classmethod
     def _mode(cls, v):
@@ -269,7 +297,8 @@ def media_public(m: Media) -> dict:
 def playlist_public(p: Playlist) -> dict:
     return {"id": p.id, "name": p.name, "description": p.description,
             "mode": p.mode or "standard", "filler_folder": p.filler_folder,
-            "filler_minutes": p.filler_minutes or 30, "created_at": p.created_at}
+            "filler_minutes": p.filler_minutes or 30,
+            "show_overlay": p.show_overlay is not False, "created_at": p.created_at}
 
 class ReorderRequest(BaseModel):
     media_ids: List[int]
@@ -428,17 +457,31 @@ async def reconvert_media(media_id: int, db: Session = Depends(get_db),
     return media_public(media)
 
 @app.get("/media")
-async def list_media(folder: str | None = None, db: Session = Depends(get_db),
+async def list_media(folder: str | None = None, page: int | None = None,
+                     page_size: int = 25, db: Session = Depends(get_db),
                      username: str = Depends(verify_admin)):
+    """Without `page`: the full list (as before). With `page` (1-based):
+    {"items", "total", "page", "pages", "page_size"}."""
     query = db.query(Media)
     if folder:
         query = query.filter(Media.folder == clean_folder_name(folder))
-    return [media_public(m) for m in query.order_by(Media.id).all()]
+    query = query.order_by(Media.id)
+    if page is None:
+        return [media_public(m) for m in query.all()]
+    page_size = max(1, min(page_size, 200))
+    total = query.count()
+    pages = max(1, -(-total // page_size))
+    page = max(1, min(page, pages))
+    items = query.offset((page - 1) * page_size).limit(page_size).all()
+    return {"items": [media_public(m) for m in items], "total": total, "page": page,
+            "pages": pages, "page_size": page_size}
 
 @app.get("/media/folders")
 async def list_folders(db: Session = Depends(get_db), username: str = Depends(verify_admin)):
     rows = db.query(Media.folder, func.count(Media.id)).group_by(Media.folder).order_by(Media.folder).all()
-    return [{"name": name, "count": count} for name, count in rows]
+    busy = dict(db.query(Media.folder, func.count(Media.id)).filter(
+        Media.status.in_(("pending", "converting"))).group_by(Media.folder).all())
+    return [{"name": name, "count": count, "converting": busy.get(name, 0)} for name, count in rows]
 
 @app.put("/media/{media_id}")
 async def update_media(
@@ -469,7 +512,8 @@ async def create_playlist(
     db_playlist = Playlist(name=playlist.name, description=playlist.description, mode=playlist.mode,
                            filler_folder=clean_folder_name(playlist.filler_folder)
                            if playlist.filler_folder else None,
-                           filler_minutes=playlist.filler_minutes)
+                           filler_minutes=playlist.filler_minutes,
+                           show_overlay=playlist.show_overlay)
     db.add(db_playlist)
     db.commit()
     db.refresh(db_playlist)
@@ -804,12 +848,130 @@ async def rename_playlist(
     if data.filler_minutes is not None and data.filler_minutes != playlist.filler_minutes:
         playlist.filler_minutes = data.filler_minutes
         filler_changed = True
+    if data.show_overlay is not None and data.show_overlay != (playlist.show_overlay is not False):
+        playlist.show_overlay = data.show_overlay
+        # Takes effect on the next block (mixed) or restart; restart separate-audio now.
+        filler_changed = filler_changed or playlist.mode == "separate_audio"
     if mode_changed:
         # The audio playlist is kept when switching back to standard, so switching
         # modes back and forth never loses work.
         playlist.mode = data.mode
     db.commit()
     db.refresh(playlist)
-    if mode_changed or (filler_changed and playlist.mode == "mixed"):
+    if mode_changed or (filler_changed and playlist.mode in ("mixed", "separate_audio")):
         restart_if_running(db, playlist)
     return playlist_public(playlist)
+
+
+# ---------- Station backups ----------
+from app.services import backup as backup_svc
+
+
+def _settings_row(db: Session) -> Settings:
+    settings = db.query(Settings).first()
+    if not settings:
+        settings = Settings(station_name="RezTV")
+        db.add(settings)
+        db.commit()
+        db.refresh(settings)
+    return settings
+
+
+def _backup_config() -> dict:
+    db = SessionLocal()
+    try:
+        s = db.query(Settings).first()
+        if not s:
+            return {"interval_hours": 0, "keep": 7, "include_media": True}
+        return {"interval_hours": s.backup_interval_hours or 0, "keep": s.backup_keep or 7,
+                "include_media": s.backup_include_media is not False}
+    finally:
+        db.close()
+
+
+def _scheduled_backup(cfg: dict):
+    backup_svc.create_backup(engine, Base.metadata, MEDIA_PATH,
+                             include_media=cfg.get("include_media", True), label="auto")
+
+
+backup_scheduler = backup_svc.Scheduler(_backup_config, _scheduled_backup)
+
+
+class BackupSettingsUpdate(BaseModel):
+    model_config = {"extra": "forbid"}
+    interval_hours: int | None = Field(default=None, ge=0, le=24 * 30)
+    keep: int | None = Field(default=None, ge=1, le=100)
+    include_media: bool | None = None
+
+
+class BackupRequest(BaseModel):
+    include_media: bool = True
+
+
+class RestoreRequest(BaseModel):
+    name: str
+    confirm: str  # must equal name; the admin page asks the user to type/confirm it
+
+
+@app.get("/backups")
+async def get_backups(username: str = Depends(verify_admin)):
+    return {"backups": backup_svc.list_backups(), "settings": _backup_config(),
+            "last_error": backup_scheduler.last_error, "backup_path": backup_svc.BACKUP_PATH}
+
+
+@app.put("/backups/settings")
+async def update_backup_settings(data: BackupSettingsUpdate, db: Session = Depends(get_db),
+                                 username: str = Depends(verify_admin)):
+    s = _settings_row(db)
+    if data.interval_hours is not None:
+        s.backup_interval_hours = data.interval_hours
+    if data.keep is not None:
+        s.backup_keep = data.keep
+    if data.include_media is not None:
+        s.backup_include_media = data.include_media
+    db.commit()
+    return _backup_config()
+
+
+@app.post("/backups")
+def backup_now(data: BackupRequest | None = None, username: str = Depends(verify_admin)):
+    # Plain def: FastAPI runs it in a worker thread, so a long backup does not block streams/API.
+    data = data or BackupRequest()
+    try:
+        return backup_svc.create_backup(engine, Base.metadata, MEDIA_PATH,
+                                        include_media=data.include_media)
+    except OSError as e:
+        log.exception("Backup failed")
+        raise HTTPException(status_code=500, detail=f"Backup failed: {e}")
+
+
+@app.delete("/backups/{name}")
+async def delete_backup(name: str, username: str = Depends(verify_admin)):
+    try:
+        backup_svc.resolve(name).unlink()
+    except (ValueError, FileNotFoundError):
+        raise HTTPException(status_code=404, detail="Backup not found")
+    return {"status": "deleted", "name": name}
+
+
+@app.post("/backups/restore")
+def restore_backup(data: RestoreRequest, username: str = Depends(verify_admin)):
+    if data.confirm != data.name:
+        raise HTTPException(status_code=400, detail="Confirmation does not match the backup name")
+    try:
+        backup_svc.resolve(data.name)
+    except (ValueError, FileNotFoundError):
+        raise HTTPException(status_code=404, detail="Backup not found")
+    # Safety net: save the current database first (small, no media).
+    safety = backup_svc.create_backup(engine, Base.metadata, MEDIA_PATH,
+                                      include_media=False, label="pre-restore")
+    stop_all()
+    try:
+        result = backup_svc.restore_backup(engine, Base.metadata, MEDIA_PATH, data.name)
+    except Exception as e:
+        log.exception("Restore failed")
+        resume_streams()
+        raise HTTPException(status_code=500, detail=f"Restore failed: {e}. "
+                            f"Current state was saved as {safety['name']}.")
+    resume_streams()  # channels marked on air in the restored backup come back
+    return {**result, "safety_backup": safety["name"]}

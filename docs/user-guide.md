@@ -124,3 +124,68 @@ Each channel writes its stream log to `logs/channel_<ID>.log` in the RezTV folde
 
 - You can rename a channel with the **Edit Name** button
 - You can delete videos or entire channels with the red **Delete** buttons. Deleting a video removes its converted file (and the original, if kept) from the server
+
+## On-screen media ID and song title
+
+On channels that play music separately from the picture (separate audio mode, and
+the filler blocks of mixed mode), RezTV draws two small captions on the video: the
+media ID of the clip on screen in the bottom left, and the title of the song
+playing in the bottom right. Programs in mixed mode (videos with their own sound)
+show nothing.
+
+- Turn it on or off per channel with the **On-screen ID & song** checkbox in the
+  channel's box. It is on for every channel by default.
+- Mixed channels pick up the change at the next filler block; separate-audio
+  channels restart right away.
+- The song title is the track's title in the library (the file name, without the
+  extension). Rename a track to change what is shown.
+- The captions follow the durations stored in the library, so they stay in step
+  with what plays. `OVERLAY_OPACITY` (default 0.6) and `OVERLAY_FONT` in `.env`
+  change the look.
+
+## Media library: folders and pages
+
+The library shows one collapsible group per folder. Click a folder's name to open
+or close it; the page remembers which folders you left open. Each folder shows 25
+items at a time, with Prev/Next buttons. Clicking a folder in the sidebar shows only
+that folder, already open, with the "Add folder to channel" bar.
+
+## Uploading several files
+
+In **Upload Video or Audio**, select several files at once (Ctrl/Cmd- or
+Shift-click in the file picker). They all go to the folder you type (optional) and
+upload one after another, each with its own line showing progress and the result
+(ID or error). A failed file does not stop the rest.
+
+## Station backup and restore
+
+A backup is one `.tar.gz` file in the backups folder (`./backups` next to
+`docker-compose.yml`; `/app/backups` in the container). It holds:
+
+- `database.json`: every channel, playlist, audio playlist, setting and media entry.
+- `media/`: every media file (optional; leave it out for a small, quick backup).
+
+**Back up now** makes a backup right away. With media included this can take a
+while and needs free disk space about the size of your media folder.
+
+**Scheduled backups**: set *every N hours* (0 turns it off), how many to keep, and
+whether to include media, then **Save Schedule**. The station checks once a minute
+and makes a backup when the newest scheduled one is older than N hours. Only
+scheduled backups are deleted when there are more than the number to keep; manual
+backups stay until you delete them.
+
+**Restore** replaces the whole station with the backup's copy: channels,
+playlists, settings and the media list, plus the media files if the backup has
+them. You confirm twice (a warning, then typing the backup's name). Before
+restoring, RezTV saves the current database as a `-pre-restore` backup (no media),
+so a restore can be undone by restoring that file. All streams stop for a moment;
+channels that were on air in the backup start again. Note that the backup schedule
+itself is part of the settings and is restored too.
+
+Files in the media folder that are not in the backup are left in place (they are
+just not listed in the library anymore). To move a station to a new server, copy
+a backup file into the new server's `backups` folder and restore it there.
+
+Keep copies of important backups off the server too (for example with `scp` or
+`rsync` from the `backups` folder), since a backup on the same disk does not help
+if that disk fails.

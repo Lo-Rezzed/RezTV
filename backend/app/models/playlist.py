@@ -41,6 +41,9 @@ class Playlist(Base):
     filler_folder = Column(String, nullable=True)
     filler_minutes = Column(Integer, nullable=False, default=DEFAULT_FILLER_MINUTES,
                             server_default=str(DEFAULT_FILLER_MINUTES))
+    # Separate-audio playback (separate_audio channels, mixed filler blocks): draw the
+    # clip's media ID bottom left and the song title bottom right.
+    show_overlay = Column(Boolean, nullable=False, default=True, server_default="true")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     media_items = relationship(

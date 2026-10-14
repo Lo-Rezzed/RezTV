@@ -10,6 +10,8 @@ from collections import deque
 from pathlib import Path
 from typing import Callable
 
+from app.services.overlay import OverlayTicker, drawtext_filters
+
 log = logging.getLogger("reztv.hls")
 
 HLS_PATH = os.getenv("HLS_PATH", "/app/hls")
@@ -66,8 +68,9 @@ class _RotatingWriter:
             self._f.close()
 
 
+_VIDEO_FILTER = "fps=30,format=yuv420p"
 _VIDEO_OUT = [
-    "-vf", "fps=30,format=yuv420p",
+    "-vf", _VIDEO_FILTER,
     "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
     "-profile:v", "main", "-crf", "22", "-g", "60", "-keyint_min", "60",
     "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*2)",
@@ -103,9 +106,20 @@ def _build_cmd(concat_file: Path, stream_dir: Path, output_m3u8: Path,
     ]
 
 
+def _video_out(overlay: tuple[Path, Path] | None) -> list[str]:
+    """Video encoder options; with overlay=(id_file, song_file) the media ID and
+    song title are drawn on the picture."""
+    if not overlay:
+        return list(_VIDEO_OUT)
+    out = list(_VIDEO_OUT)
+    out[1] = f"{_VIDEO_FILTER},{drawtext_filters(*overlay)}"
+    return out
+
+
 def _build_separate_audio_cmd(video_concat: Path, audio_concat: Path,
                               stream_dir: Path, output_m3u8: Path,
-                              duration: float | None = None) -> list[str]:
+                              duration: float | None = None,
+                              overlay: tuple[Path, Path] | None = None) -> list[str]:
     """Separate-audio channel: two inputs, each its own endless loop, read in real
     time. Picture comes from the video list (its sound is dropped), sound from the
     audio list. The two lists switch items independently, so a song keeps playing
@@ -122,7 +136,7 @@ def _build_separate_audio_cmd(video_concat: Path, audio_concat: Path,
         "-re", "-f", "concat", "-safe", "0", "-stream_loop", "-1",
         "-i", str(audio_concat),
         "-map", "0:v:0", "-map", "1:a:0",
-        *_VIDEO_OUT,
+        *_video_out(overlay),
         "-af", af,
         *_AUDIO_OUT,
         *(["-t", f"{duration:.0f}"] if duration else []),
@@ -141,9 +155,20 @@ def _normalize_source(src) -> dict:
                 "video": list(src.get("video") or []),
                 "audio": list(src.get("audio") or []),
                 "filler": list(src.get("filler") or []),
-                "filler_seconds": float(src.get("filler_seconds") or DEFAULT_FILLER_SECONDS)}
+                "filler_seconds": float(src.get("filler_seconds") or DEFAULT_FILLER_SECONDS),
+                "overlay": bool(src.get("overlay", False)),
+                # Optional per-file info ({"id", "title", "duration"}), same order as the lists.
+                "video_meta": list(src.get("video_meta") or []),
+                "audio_meta": list(src.get("audio_meta") or []),
+                "filler_meta": list(src.get("filler_meta") or [])}
     return {"mode": "standard", "video": list(src or []), "audio": [], "filler": [],
-            "filler_seconds": DEFAULT_FILLER_SECONDS}
+            "filler_seconds": DEFAULT_FILLER_SECONDS, "overlay": False,
+            "video_meta": [], "audio_meta": [], "filler_meta": []}
+
+
+def _meta(src: dict, key: str, files: list[str]) -> list[dict]:
+    meta = src.get(f"{key}_meta") or []
+    return meta if len(meta) == len(src[key]) else [{"title": os.path.basename(f)} for f in files]
 
 
 def _source_problem(src: dict) -> str | None:
@@ -198,6 +223,7 @@ class _Channel:
         self.phase: str | None = None   # mixed channels: "program" or "filler"
         self.program_idx = 0
         self.block = 0
+        self.overlay: OverlayTicker | None = None
         self._fresh = True             # clear old HLS files only on the first start
         self.thread = threading.Thread(target=self._supervise, daemon=True,
                                        name=f"stream-{playlist_id}")
@@ -213,23 +239,45 @@ class _Channel:
         video_concat = stream_dir / "playlist.txt"
         if src["mode"] == "mixed":
             if self.phase == "filler":
-                clips = list(src["filler"])
-                random.shuffle(clips)
+                order = list(range(len(src["filler"])))
+                random.shuffle(order)
+                clips = [src["filler"][i] for i in order]
+                clip_meta = [_meta(src, "filler", src["filler"])[i] for i in order]
                 music = list(src["audio"])
+                music_meta = _meta(src, "audio", music)
                 k = self.block % len(music)   # start each block on the next song
                 _write_concat(video_concat, clips)
                 audio_concat = stream_dir / "audio.txt"
                 _write_concat(audio_concat, music[k:] + music[:k])
-                return _build_separate_audio_cmd(video_concat, audio_concat, stream_dir, out,
-                                                 duration=src["filler_seconds"])
+                return _build_separate_audio_cmd(
+                    video_concat, audio_concat, stream_dir, out, duration=src["filler_seconds"],
+                    overlay=self._overlay(src, stream_dir, clip_meta,
+                                          music_meta[k:] + music_meta[:k]))
             _write_concat(video_concat, [src["video"][self.program_idx]])
             return _build_cmd(video_concat, stream_dir, out, loop=False)
         _write_concat(video_concat, src["video"])
         if src["mode"] == "separate_audio":
             audio_concat = stream_dir / "audio.txt"
             _write_concat(audio_concat, src["audio"])
-            return _build_separate_audio_cmd(video_concat, audio_concat, stream_dir, out)
+            return _build_separate_audio_cmd(
+                video_concat, audio_concat, stream_dir, out,
+                overlay=self._overlay(src, stream_dir, _meta(src, "video", src["video"]),
+                                      _meta(src, "audio", src["audio"])))
         return _build_cmd(video_concat, stream_dir, out)
+
+    def _overlay(self, src: dict, stream_dir: Path, clips: list[dict],
+                 songs: list[dict]) -> tuple[Path, Path] | None:
+        """Set up the on-screen media ID / song title for this run (if enabled)."""
+        if not src.get("overlay"):
+            return None
+        files = (stream_dir / "overlay_id.txt", stream_dir / "overlay_song.txt")
+        self.overlay = OverlayTicker(files[0], files[1], clips, songs)
+        return files
+
+    def _stop_overlay(self):
+        if self.overlay:
+            self.overlay.stop()
+            self.overlay = None
 
     @staticmethod
     def _clear(stream_dir: Path):
@@ -243,6 +291,7 @@ class _Channel:
                     log.warning("Could not remove old HLS file %s: %s", f, e)
 
     def _spawn(self, src: dict):
+        self._stop_overlay()
         cmd = self._prepare(src)
         extra = (f", {len(src['audio'])} audio tracks"
                  if src["mode"] == "separate_audio" else "")
@@ -261,6 +310,8 @@ class _Channel:
             preexec_fn=os.setsid,
         )
         proc = self.process
+        if self.overlay:
+            self.overlay.start()
         threading.Thread(target=self._pump, args=(proc,), daemon=True).start()
 
     def _pump(self, proc: subprocess.Popen):
@@ -337,6 +388,7 @@ class _Channel:
             self.stop_event.wait(backoff)
             backoff = min(backoff * 2, BACKOFF_MAX)
         self._kill()
+        self._stop_overlay()
         self.logger.write(f"=== {time.strftime('%Y-%m-%d %H:%M:%S')} stopped ===")
         self.logger.close()
 
