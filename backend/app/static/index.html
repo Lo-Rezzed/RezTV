@@ -57,7 +57,12 @@
     <select id="playlistMode" title="How the channel plays sound">
       <option value="standard">Standard: each video plays with its own sound</option>
       <option value="separate_audio">Separate audio: video playlist + music playlist, played together</option>
+      <option value="mixed">Mixed: programs (own sound) alternating with filler blocks (shuffled clips + music)</option>
     </select>
+    <span id="mixedOptions" style="display:none;">
+      <input type="text" id="fillerFolder" placeholder="Filler clips folder" title="Media folder whose videos are shuffled for filler blocks">
+      <input type="number" id="fillerMinutes" value="30" min="1" max="720" style="width:5em;" title="Filler block length in minutes"> min
+    </span>
     <button onclick="createPlaylist()">Create Channel</button>
     <p id="playlistStatus"></p>
   </section>
@@ -91,7 +96,14 @@
 
   <script>
     const API = "";
-    const MODE_LABELS = { standard: "Standard", separate_audio: "Separate audio" };
+    const MODE_LABELS = { standard: "Standard", separate_audio: "Separate audio", mixed: "Mixed" };
+    const HAS_AUDIO_LIST = mode => mode === "separate_audio" || mode === "mixed";
+    document.addEventListener("DOMContentLoaded", () => {
+      const sel = document.getElementById("playlistMode");
+      sel.addEventListener("change", () => {
+        document.getElementById("mixedOptions").style.display = sel.value === "mixed" ? "" : "none";
+      });
+    });
     let channelModes = {};  // channel id -> mode, refreshed by loadMedia/loadPlaylists
 
     // ========== Station Name ==========
@@ -183,7 +195,11 @@
       const res = await fetch(`${API}/playlists`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, mode: document.getElementById("playlistMode").value })
+        body: JSON.stringify(Object.assign({ name, mode: document.getElementById("playlistMode").value },
+          document.getElementById("playlistMode").value === "mixed" ? {
+            filler_folder: document.getElementById("fillerFolder").value.trim() || null,
+            filler_minutes: parseInt(document.getElementById("fillerMinutes").value, 10) || 30
+          } : {}))
       });
       const data = await res.json();
       document.getElementById("playlistStatus").innerHTML = `<span class="success">Created: ${data.name} (ID: ${data.id}, ${MODE_LABELS[data.mode] || data.mode})</span>`;
@@ -246,7 +262,7 @@
         const badge = `<span title="${(m.error || "").replace(/"/g, "&quot;")}" style="color:${colors[m.status] || "#888"}; font-weight:bold; font-size:0.85rem;">${m.status}</span>`;
         const isAudio = m.kind === "audio";
         // Videos can go on any channel; audio tracks only into a separate-audio channel's music list.
-        const targets = isAudio ? playlists.filter(p => p.mode === "separate_audio") : playlists;
+        const targets = isAudio ? playlists.filter(p => HAS_AUDIO_LIST(p.mode)) : playlists;
         const options = targets.map(p => `<option value="${p.id}">${p.name}${isAudio ? " (audio playlist)" : ""}</option>`).join("");
         const kindTag = isAudio ? `<span style="color:#06c; font-size:0.85rem;">&#9835; audio</span>` : "";
         return `
@@ -332,7 +348,7 @@
       // Videos go to the video playlist; on separate-audio channels, audio tracks
       // in the folder go to the audio playlist.
       const results = [["videos", await post("folder")]];
-      if (channelModes[playlistId] === "separate_audio") results.push(["audio tracks", await post("audio-folder")]);
+      if (HAS_AUDIO_LIST(channelModes[playlistId])) results.push(["audio tracks", await post("audio-folder")]);
 
       const lines = [];
       for (const [what, r] of results) {
@@ -370,7 +386,8 @@
 
       for (const p of playlists) {
         channelModes[p.id] = p.mode;
-        const separate = p.mode === "separate_audio";
+        const separate = HAS_AUDIO_LIST(p.mode);
+        const mixed = p.mode === "mixed";
         const [mediaItems, audioItems] = await Promise.all([
           fetch(`${API}/playlists/${p.id}/media`).then(r => r.json()),
           separate ? fetch(`${API}/playlists/${p.id}/audio`).then(r => r.json()) : Promise.resolve([])
@@ -379,7 +396,7 @@
         const fmt = s => s ? ` <small style="color:#888;">${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}</small>` : "";
         const audioListHtml = !separate ? "" : `
           <div style="margin-top:10px;"><strong>&#9835; Audio playlist</strong>
-            <small style="color:#888;">plays continuously over the videos; video sound is muted</small></div>
+            <small style="color:#888;">${mixed ? "plays under the filler blocks" : "plays continuously over the videos; video sound is muted"}</small></div>
           ${audioItems.length === 0
             ? `<p style="color:#888; margin:10px 0;">No audio tracks yet. Upload music, then add it from the Media Library.</p>`
             : `<ul class="sortable" data-playlist-id="${p.id}" data-list="audio" style="list-style:none; padding:0; margin:12px 0;">
@@ -417,9 +434,12 @@
             <div>
               <button onclick="editChannelName(${p.id})">Edit Name</button>
               <button onclick="changeMode(${p.id}, '${p.mode}')">Change Mode</button>
+              ${mixed ? `<button onclick="editFiller(${p.id})">Filler Settings</button>` : ""}
             </div>
           </div>
-          ${separate ? `<div style="margin-top:10px;"><strong>Video playlist</strong></div>` : ""}
+          ${mixed ? `<div style="margin-top:10px; color:#555;">Plays: program &rarr; ${p.filler_minutes} min filler block &rarr; next program...
+            Filler clips: folder <strong id="filler-folder-${p.id}">${p.filler_folder || "(none set)"}</strong></div>` : ""}
+          ${separate ? `<div style="margin-top:10px;"><strong>${mixed ? "Programs (each plays with its own sound)" : "Video playlist"}</strong></div>` : ""}
           ${mediaListHtml}
           ${audioListHtml}
           <div style="margin-top: 12px;">
@@ -438,6 +458,22 @@
       container.replaceChildren(fragment);
 
       enableDragAndDrop();
+    }
+
+    // ========== Mixed mode filler settings ==========
+    async function editFiller(id) {
+      const p = (await fetch(`${API}/playlists/${id}`).then(r => r.json()));
+      const folder = prompt("Filler clips folder (videos in this media folder are shuffled during filler blocks):", p.filler_folder || "");
+      if (folder === null) return;
+      const mins = prompt("Filler block length in minutes:", p.filler_minutes || 30);
+      if (mins === null) return;
+      const res = await fetch(`${API}/playlists/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filler_folder: folder, filler_minutes: parseInt(mins, 10) || 30 })
+      });
+      if (!res.ok) alert("Failed to save filler settings");
+      loadPlaylists();
     }
 
     // ========== Edit Channel Name ==========
@@ -461,11 +497,14 @@
 
     // ========== Channel Mode ==========
     async function changeMode(id, current) {
-      const next = current === "separate_audio" ? "standard" : "separate_audio";
-      const msg = next === "separate_audio"
-        ? "Switch to SEPARATE AUDIO? The channel will play its videos muted, with music from its own audio playlist. If it is on air it restarts (it stops if the audio playlist is still empty)."
-        : "Switch to STANDARD? Each video will play with its own sound again. The audio playlist is kept in case you switch back. If it is on air it restarts.";
-      if (!confirm(msg)) return;
+      const answer = prompt(`Current mode: ${MODE_LABELS[current] || current}. Type the new mode:\n` +
+        "standard: each video plays with its own sound\n" +
+        "separate_audio: videos muted, music from the audio playlist\n" +
+        "mixed: programs with their own sound, alternating with filler blocks (shuffled clips + music)\n\n" +
+        "Lists are kept when switching. If the channel is on air it restarts.", current);
+      const next = (answer || "").trim();
+      if (!next || next === current) return;
+      if (!MODE_LABELS[next]) return alert("Mode must be standard, separate_audio or mixed");
       const res = await fetch(`${API}/playlists/${id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },

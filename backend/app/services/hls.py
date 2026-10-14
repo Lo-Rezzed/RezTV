@@ -1,6 +1,7 @@
 """ffmpeg stream management with supervision, auto-restart and per-channel logs."""
 import logging
 import os
+import random
 import signal
 import subprocess
 import threading
@@ -76,19 +77,24 @@ _AUDIO_OUT = ["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2"]
 
 
 def _hls_out(stream_dir: Path, output_m3u8: Path) -> list[str]:
+    # append_list + discont_start: when a mixed channel switches between a program
+    # and a filler block, the next ffmpeg continues the same playlist and segment
+    # numbering and marks the join, so viewers keep watching across the switch.
     return [
         "-f", "hls", "-hls_time", "6", "-hls_list_size", "10",
-        "-hls_flags", "delete_segments+append_list+omit_endlist+independent_segments",
+        "-hls_flags", "delete_segments+append_list+omit_endlist+independent_segments+discont_start",
         "-hls_segment_filename", str(stream_dir / "segment_%03d.ts"),
         str(output_m3u8),
     ]
 
 
-def _build_cmd(concat_file: Path, stream_dir: Path, output_m3u8: Path) -> list[str]:
-    """Standard channel: each video plays with its own sound."""
+def _build_cmd(concat_file: Path, stream_dir: Path, output_m3u8: Path,
+               loop: bool = True) -> list[str]:
+    """Standard channel: each video plays with its own sound.
+    loop=False plays the list once and exits (a program slot on a mixed channel)."""
     return [
         FFMPEG_BIN, "-hide_banner", "-loglevel", "warning",
-        "-re", "-f", "concat", "-safe", "0", "-stream_loop", "-1",
+        "-re", "-f", "concat", "-safe", "0", "-stream_loop", "-1" if loop else "0",
         "-i", str(concat_file),
         *_VIDEO_OUT,
         "-af", "aresample=44100",
@@ -98,7 +104,8 @@ def _build_cmd(concat_file: Path, stream_dir: Path, output_m3u8: Path) -> list[s
 
 
 def _build_separate_audio_cmd(video_concat: Path, audio_concat: Path,
-                              stream_dir: Path, output_m3u8: Path) -> list[str]:
+                              stream_dir: Path, output_m3u8: Path,
+                              duration: float | None = None) -> list[str]:
     """Separate-audio channel: two inputs, each its own endless loop, read in real
     time. Picture comes from the video list (its sound is dropped), sound from the
     audio list. The two lists switch items independently, so a song keeps playing
@@ -118,8 +125,12 @@ def _build_separate_audio_cmd(video_concat: Path, audio_concat: Path,
         *_VIDEO_OUT,
         "-af", af,
         *_AUDIO_OUT,
+        *(["-t", f"{duration:.0f}"] if duration else []),
         *_hls_out(stream_dir, output_m3u8),
     ]
+
+
+DEFAULT_FILLER_SECONDS = 30 * 60
 
 
 def _normalize_source(src) -> dict:
@@ -128,16 +139,44 @@ def _normalize_source(src) -> dict:
     if isinstance(src, dict):
         return {"mode": src.get("mode") or "standard",
                 "video": list(src.get("video") or []),
-                "audio": list(src.get("audio") or [])}
-    return {"mode": "standard", "video": list(src or []), "audio": []}
+                "audio": list(src.get("audio") or []),
+                "filler": list(src.get("filler") or []),
+                "filler_seconds": float(src.get("filler_seconds") or DEFAULT_FILLER_SECONDS)}
+    return {"mode": "standard", "video": list(src or []), "audio": [], "filler": [],
+            "filler_seconds": DEFAULT_FILLER_SECONDS}
 
 
 def _source_problem(src: dict) -> str | None:
+    if src["mode"] == "mixed":
+        if not src["video"] and not (src["filler"] and src["audio"]):
+            return "Channel has no ready programs, and no filler clips plus music"
+        return None
     if not src["video"]:
         return "Channel has no ready videos"
     if src["mode"] == "separate_audio" and not src["audio"]:
         return "Channel has no ready audio tracks"
     return None
+
+
+def _has_filler(src: dict) -> bool:
+    return bool(src["filler"] and src["audio"] and src["filler_seconds"] > 0)
+
+
+def next_mixed_slot(src: dict, phase: str | None, program_idx: int) -> tuple[str, int]:
+    """Mixed channel sequencing: program, filler block, program, filler block...
+    phase is what just finished (None at start). Returns (next_phase, program_idx);
+    program_idx is the program to play next. With no programs only filler plays,
+    with no filler (or no music) programs play back to back."""
+    has_programs, has_filler = bool(src["video"]), _has_filler(src)
+    if phase == "program":
+        program_idx += 1
+        if has_filler:
+            return "filler", program_idx
+    elif phase is None and not has_programs:
+        return "filler", program_idx
+    if phase == "filler" and not has_programs:
+        return "filler", program_idx
+    return "program", program_idx % max(len(src["video"]), 1)
 
 
 def _write_concat(path: Path, files: list[str]):
@@ -156,6 +195,10 @@ class _Channel:
         self.restarts = 0
         self.last_exit: int | None = None
         self.logger = _RotatingWriter(log_file(playlist_id))
+        self.phase: str | None = None   # mixed channels: "program" or "filler"
+        self.program_idx = 0
+        self.block = 0
+        self._fresh = True             # clear old HLS files only on the first start
         self.thread = threading.Thread(target=self._supervise, daemon=True,
                                        name=f"stream-{playlist_id}")
 
@@ -163,6 +206,33 @@ class _Channel:
     def _prepare(self, src: dict) -> list[str]:
         stream_dir = Path(HLS_PATH) / f"playlist_{self.playlist_id}"
         stream_dir.mkdir(parents=True, exist_ok=True)
+        if self._fresh:
+            self._clear(stream_dir)
+            self._fresh = False
+        out = stream_dir / "index.m3u8"
+        video_concat = stream_dir / "playlist.txt"
+        if src["mode"] == "mixed":
+            if self.phase == "filler":
+                clips = list(src["filler"])
+                random.shuffle(clips)
+                music = list(src["audio"])
+                k = self.block % len(music)   # start each block on the next song
+                _write_concat(video_concat, clips)
+                audio_concat = stream_dir / "audio.txt"
+                _write_concat(audio_concat, music[k:] + music[:k])
+                return _build_separate_audio_cmd(video_concat, audio_concat, stream_dir, out,
+                                                 duration=src["filler_seconds"])
+            _write_concat(video_concat, [src["video"][self.program_idx]])
+            return _build_cmd(video_concat, stream_dir, out, loop=False)
+        _write_concat(video_concat, src["video"])
+        if src["mode"] == "separate_audio":
+            audio_concat = stream_dir / "audio.txt"
+            _write_concat(audio_concat, src["audio"])
+            return _build_separate_audio_cmd(video_concat, audio_concat, stream_dir, out)
+        return _build_cmd(video_concat, stream_dir, out)
+
+    @staticmethod
+    def _clear(stream_dir: Path):
         for pattern in ("*.ts", "*.m3u8"):
             for f in stream_dir.glob(pattern):
                 try:
@@ -171,19 +241,16 @@ class _Channel:
                     pass
                 except OSError as e:
                     log.warning("Could not remove old HLS file %s: %s", f, e)
-        out = stream_dir / "index.m3u8"
-        video_concat = stream_dir / "playlist.txt"
-        _write_concat(video_concat, src["video"])
-        if src["mode"] == "separate_audio":
-            audio_concat = stream_dir / "audio.txt"
-            _write_concat(audio_concat, src["audio"])
-            return _build_separate_audio_cmd(video_concat, audio_concat, stream_dir, out)
-        return _build_cmd(video_concat, stream_dir, out)
 
     def _spawn(self, src: dict):
         cmd = self._prepare(src)
         extra = (f", {len(src['audio'])} audio tracks"
                  if src["mode"] == "separate_audio" else "")
+        if src["mode"] == "mixed":
+            extra = (f", now {self.phase} block #{self.block}"
+                     f" ({len(src['filler'])} filler clips, {len(src['audio'])} tracks,"
+                     f" {src['filler_seconds'] / 60:g} min)" if self.phase == "filler"
+                     else f", now program {self.program_idx + 1} of {len(src['video'])}")
         self.logger.write(f"=== {time.strftime('%Y-%m-%d %H:%M:%S')} starting ffmpeg "
                           f"(mode {src['mode']}: {len(src['video'])} videos{extra}, "
                           f"restart #{self.restarts}) ===")
@@ -230,6 +297,15 @@ class _Channel:
                 self.stop_event.wait(backoff)
                 backoff = min(backoff * 2, BACKOFF_MAX)
                 continue
+            if files["mode"] == "mixed" and self.phase is None:
+                self.phase, self.program_idx = next_mixed_slot(files, None, 0)
+            elif files["mode"] == "mixed":
+                # The lists may have changed since the last slot; stay in range.
+                if self.phase == "program" and not files["video"]:
+                    self.phase = "filler"
+                elif self.phase == "filler" and not _has_filler(files):
+                    self.phase = "program"
+                self.program_idx %= max(len(files["video"]), 1)
             started = time.monotonic()
             try:
                 self._spawn(files)
@@ -242,6 +318,15 @@ class _Channel:
                 if self.stop_event.is_set():
                     break
                 self.last_exit = self.process.returncode
+                if files["mode"] == "mixed" and self.last_exit == 0:
+                    # Slot finished normally: go straight to the next one.
+                    if self.phase == "filler":
+                        self.block += 1
+                    self.phase, self.program_idx = next_mixed_slot(
+                        files, self.phase, self.program_idx)
+                    self.logger.write(f"Slot finished; next: {self.phase}")
+                    backoff = BACKOFF_START
+                    continue
                 msg = f"ffmpeg exited with code {self.last_exit}"
                 self.logger.write(msg)
                 log.warning("Channel %s: %s", self.playlist_id, msg)
@@ -291,7 +376,7 @@ def stream_status(playlist_id: int) -> dict:
         return {"running": False}
     alive = ch.process is not None and ch.process.poll() is None
     return {"running": True, "ffmpeg_alive": alive, "restarts": ch.restarts,
-            "last_exit_code": ch.last_exit}
+            "last_exit_code": ch.last_exit, "slot": ch.phase}
 
 
 def read_log_tail(playlist_id: int, lines: int = 100) -> list[str]:

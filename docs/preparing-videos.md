@@ -25,6 +25,8 @@ Once the upload finishes, RezTV converts the file in the background to the stati
 | Silent clips | A silent audio track is added, so the channel's sound never drops out | |
 | GIFs | Looped until they last at least 30 seconds | `GIF_MIN_SECONDS` |
 
+**Already in the station format? No re-encode.** If an upload is already an MP4 (or MOV) with H.264 yuv420p video at exactly the station size and frame rate (within 0.05 fps) and one AAC stereo 44.1 kHz audio track, RezTV only copies it into a fresh MP4 with fast-start (a few seconds, no quality loss) instead of re-encoding it. Volume is not evened out on this path, so normalize finished programs before you export them. The server log says which path each upload took ("already matches station format; remuxing only" or "converting audio only" or "needs re-encode: <reason>"). If only the sound is off (for example 48 kHz instead of 44.1 kHz, or no audio track), the picture is copied as is and just the sound is converted and evened out, which takes seconds to a minute instead of a full re-encode. Set `CONVERT_SKIP_MATCHING=false` to always re-encode.
+
 Audio files are converted to AAC stereo, 44.1 kHz, 192 kbps, evened out to the same loudness target (`STATION_LOUDNORM`), with cover art and tags removed. They are stored as `.mka` files next to the videos. Conversion is fast: a few seconds per song.
 
 The Media Library shows each file's status:
