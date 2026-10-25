@@ -10,6 +10,7 @@ import math
 import os
 import queue
 import re
+from fractions import Fraction
 import subprocess
 import threading
 
@@ -46,9 +47,10 @@ CONVERT_PRESET = os.getenv("CONVERT_PRESET", "veryfast")
 CONVERT_CRF = os.getenv("CONVERT_CRF", "20")
 CONVERT_TIMEOUT = int(os.getenv("CONVERT_TIMEOUT_SECONDS", "21600"))  # 6 hours
 # Uploads that already match the station format (MP4, H.264 yuv420p, AAC, station
-# size and frame rate) are only remuxed (stream copy + faststart), not re-encoded.
+# size and a constant frame rate of exactly STATION_FPS) are only remuxed (stream
+# copy + faststart), not re-encoded. Anything else (29.97 fps, variable frame rate,
+# other sizes...) is re-encoded to the station spec.
 SKIP_MATCHING = _bool("CONVERT_SKIP_MATCHING", True)
-FPS_TOLERANCE = float(os.getenv("CONVERT_FPS_TOLERANCE", "0.05"))
 
 
 def probe(path: str, kind: str = "video") -> dict:
@@ -74,14 +76,29 @@ def probe(path: str, kind: str = "video") -> dict:
             "duration": float(m.group(1)) if m else None}
 
 
-def _rate(v) -> float | None:
+def _exact_rate(v) -> Fraction | None:
+    """ffprobe rate string ("30/1", "30000/1001", "15360/512") as an exact fraction."""
     try:
-        if isinstance(v, str) and "/" in v:
-            n, d = v.split("/", 1)
-            return float(n) / float(d) if float(d) else None
-        return float(v)
-    except (TypeError, ValueError):
+        f = Fraction(str(v))
+    except (TypeError, ValueError, ZeroDivisionError):
         return None
+    return f if f > 0 else None
+
+
+def frame_rate_problem(stream: dict) -> str | None:
+    """None if the video stream is constant-frame-rate at exactly STATION_FPS.
+    Both ffprobe rates must equal FPS/1: r_frame_rate (the base rate) and
+    avg_frame_rate (frames / duration). 29.97 (30000/1001) fails, and so does a
+    variable-frame-rate export, where the two rates differ."""
+    r = _exact_rate(stream.get("r_frame_rate"))
+    avg = _exact_rate(stream.get("avg_frame_rate"))
+    if r == FPS and avg == FPS:
+        return None
+    if r is not None and avg is not None and r != avg:
+        return (f"variable frame rate (r_frame_rate {stream.get('r_frame_rate')}, "
+                f"avg_frame_rate {stream.get('avg_frame_rate')}; station {FPS} constant)")
+    fps = avg or r
+    return f"frame rate {float(fps):.3f} (station {FPS})" if fps else f"frame rate unknown (station {FPS})"
 
 
 def probe_streams(path: str) -> dict:
@@ -132,9 +149,9 @@ def station_check(details: dict, src: str) -> tuple[bool, bool, str]:
     sar = v.get("sample_aspect_ratio")
     if sar not in (None, "", "1:1", "0:1", "N/A"):
         return False, False, f"sample aspect ratio {sar}"
-    fps = _rate(v.get("avg_frame_rate")) or _rate(v.get("r_frame_rate"))
-    if not fps or abs(fps - FPS) > FPS_TOLERANCE:
-        return False, False, f"frame rate {fps} (station {FPS})"
+    fps_problem = frame_rate_problem(v)
+    if fps_problem:
+        return False, False, fps_problem
     # The stream needs every file to have one stereo 44.1 kHz AAC track, the
     # layout the converter produces (silent videos get a silent track).
     if len(auds) != 1:
@@ -145,6 +162,24 @@ def station_check(details: dict, src: str) -> tuple[bool, bool, str]:
     if str(a.get("sample_rate")) != "44100" or int(a.get("channels") or 0) != 2:
         return True, False, f"audio {a.get('sample_rate')} Hz / {a.get('channels')} ch (station 44100 Hz stereo)"
     return True, True, "matches station format"
+
+
+def conform_plan(details: dict, src: str, skip_matching: bool | None = None) -> dict:
+    """How an uploaded video will be brought to the station spec.
+    action: "remux" (already matches; stream copy only), "audio_fix" (picture
+    matches; only the sound is converted) or "reencode" (picture converted to
+    STATION_RESOLUTION, constant STATION_FPS, H.264 yuv420p). `converted` is True
+    when the picture is re-encoded, i.e. the upload did not match the spec."""
+    skip = SKIP_MATCHING if skip_matching is None else skip_matching
+    if not skip:
+        return {"action": "reencode", "converted": True,
+                "reason": "skip disabled (CONVERT_SKIP_MATCHING=false)"}
+    v_ok, a_ok, why = station_check(details, src)
+    if v_ok and a_ok:
+        return {"action": "remux", "converted": False, "reason": why}
+    if v_ok:
+        return {"action": "audio_fix", "converted": False, "reason": why}
+    return {"action": "reencode", "converted": True, "reason": why}
 
 
 def build_remux_command(src: str, dst: str) -> list[str]:
@@ -285,17 +320,16 @@ class Converter:
                 cmd = build_audio_command(src, tmp)
             else:
                 is_gif = src.lower().endswith(".gif")
-                v_ok, a_ok, why = (station_check(probe_streams(src), src) if SKIP_MATCHING
-                                   else (False, False, "skip disabled (CONVERT_SKIP_MATCHING=false)"))
-                if v_ok and a_ok:
+                plan = conform_plan(probe_streams(src) if SKIP_MATCHING else {}, src)
+                if plan["action"] == "remux":
                     log.info("Media %s already matches station format; remuxing only", mid)
                     cmd = build_remux_command(src, tmp)
-                elif v_ok:
+                elif plan["action"] == "audio_fix":
                     log.info("Media %s picture matches station format; copying video, "
-                             "converting audio only: %s", mid, why)
+                             "converting audio only: %s", mid, plan["reason"])
                     cmd = build_audio_fix_command(src, tmp, info)
                 else:
-                    log.info("Media %s needs re-encode: %s", mid, why)
+                    log.info("Media %s needs re-encode: %s", mid, plan["reason"])
                     cmd = build_command(src, tmp, info, is_gif)
             log.info("Converting media %s: %s", mid, " ".join(cmd))
             r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
