@@ -105,7 +105,8 @@ def _ensure_overlay_and_backup_columns():
 
 _ensure_overlay_and_backup_columns()
 
-from app.services.convert import Converter, probe as probe_media
+from app.services.convert import (Converter, probe as probe_media, probe_streams,
+                                  conform_plan)
 converter = Converter(SessionLocal, Media)
 
 
@@ -307,6 +308,9 @@ class MediaUpdate(BaseModel):
     title: str | None = None
 class FolderRequest(BaseModel):
     folder: str
+class DuplicateCheck(BaseModel):
+    folder: str = ""
+    filenames: List[str] = Field(default_factory=list, max_length=1000)
 
 def next_position(db: Session, playlist_id: int, table=playlist_media) -> int:
     current = db.query(func.max(table.c.position)).filter(
@@ -416,6 +420,12 @@ async def upload_video(
             os.remove(file_location)
         raise
 
+    conform = None
+    if kind == "video":
+        # Same decision the converter makes; reported so the admin page can warn
+        # about files that did not match the station spec and will be re-encoded.
+        conform = conform_plan(probe_streams(file_location), file_location)
+
     media = Media(
         filename=unique_name,
         original_filename=file.filename,
@@ -437,7 +447,9 @@ async def upload_video(
         "filename": media.original_filename,
         "folder": media.folder,
         "kind": media.kind,
-        "status": media.status
+        "status": media.status,
+        "duration": media.duration,
+        "conform": conform,
     }
 
 @app.post("/media/{media_id}/convert")
@@ -456,16 +468,31 @@ async def reconvert_media(media_id: int, db: Session = Depends(get_db),
     converter.enqueue(media.id)
     return media_public(media)
 
+MEDIA_SORTS = ("oldest", "newest")
+
+def _like_escape(v: str) -> str:
+    return v.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
 @app.get("/media")
 async def list_media(folder: str | None = None, page: int | None = None,
-                     page_size: int = 25, db: Session = Depends(get_db),
+                     page_size: int = 25, q: str | None = None, sort: str = "oldest",
+                     db: Session = Depends(get_db),
                      username: str = Depends(verify_admin)):
     """Without `page`: the full list (as before). With `page` (1-based):
-    {"items", "total", "page", "pages", "page_size"}."""
+    {"items", "total", "page", "pages", "page_size"}.
+    `q` filters by file name or title (case-insensitive, anywhere in the name);
+    `sort` is "oldest" (by ID, the default) or "newest" (highest ID first)."""
+    if sort not in MEDIA_SORTS:
+        raise HTTPException(status_code=400, detail="sort must be oldest or newest")
     query = db.query(Media)
     if folder:
         query = query.filter(Media.folder == clean_folder_name(folder))
-    query = query.order_by(Media.id)
+    q = (q or "").strip()[:200]
+    if q:
+        pattern = f"%{_like_escape(q)}%"
+        query = query.filter(Media.original_filename.ilike(pattern, escape="\\")
+                             | Media.title.ilike(pattern, escape="\\"))
+    query = query.order_by(Media.id.desc() if sort == "newest" else Media.id)
     if page is None:
         return [media_public(m) for m in query.all()]
     page_size = max(1, min(page_size, 200))
@@ -476,12 +503,56 @@ async def list_media(folder: str | None = None, page: int | None = None,
     return {"items": [media_public(m) for m in items], "total": total, "page": page,
             "pages": pages, "page_size": page_size}
 
+def _empty_folder_dirs() -> set[str]:
+    """Folders made with "Create folder" (or emptied) exist only as a directory
+    under MEDIA_PATH. Only names that are valid folder names count."""
+    try:
+        names = os.listdir(MEDIA_PATH)
+    except OSError:
+        return set()
+    return {n for n in names if os.path.isdir(os.path.join(MEDIA_PATH, n))
+            and clean_folder_name(n) == n}
+
 @app.get("/media/folders")
 async def list_folders(db: Session = Depends(get_db), username: str = Depends(verify_admin)):
-    rows = db.query(Media.folder, func.count(Media.id)).group_by(Media.folder).order_by(Media.folder).all()
+    counts = dict(db.query(Media.folder, func.count(Media.id)).group_by(Media.folder).all())
     busy = dict(db.query(Media.folder, func.count(Media.id)).filter(
         Media.status.in_(("pending", "converting"))).group_by(Media.folder).all())
-    return [{"name": name, "count": count, "converting": busy.get(name, 0)} for name, count in rows]
+    names = sorted(set(counts) | _empty_folder_dirs(), key=lambda n: n.lower())
+    return [{"name": n, "count": counts.get(n, 0), "converting": busy.get(n, 0)} for n in names]
+
+@app.post("/media/folders")
+async def create_folder(data: FolderRequest, username: str = Depends(verify_admin)):
+    """Create an empty media folder (a directory under MEDIA_PATH), so it shows in
+    the folder pickers before anything is uploaded to it."""
+    if not data.folder.strip() or clean_folder_name(data.folder) != re.sub(r"\s+", " ", data.folder.strip()):
+        raise HTTPException(status_code=400, detail="Folder names can use letters, numbers, spaces, - and _ "
+                            "(up to 64 characters)")
+    name = clean_folder_name(data.folder)
+    path = os.path.join(MEDIA_PATH, name)
+    existed = os.path.isdir(path)
+    os.makedirs(path, exist_ok=True)
+    return {"name": name, "created": not existed}
+
+def find_duplicates(db: Session, folder: str, filenames: list[str]) -> list[dict]:
+    """Uploads whose file name (case-insensitive) is already in `folder`."""
+    wanted = {f.strip().lower(): f for f in filenames if f and f.strip()}
+    if not wanted:
+        return []
+    rows = db.query(Media.id, Media.original_filename).filter(
+        Media.folder == folder,
+        func.lower(Media.original_filename).in_(list(wanted))).order_by(Media.id).all()
+    found: dict[str, list[int]] = {}
+    for mid, name in rows:
+        found.setdefault(name.lower(), []).append(mid)
+    return [{"filename": wanted[k], "ids": found[k]} for k in wanted if k in found]
+
+@app.post("/media/duplicates")
+async def check_duplicates(data: DuplicateCheck, db: Session = Depends(get_db),
+                           username: str = Depends(verify_admin)):
+    """Before uploading: which of these file names already exist in the target folder."""
+    folder = clean_folder_name(data.folder)
+    return {"folder": folder, "duplicates": find_duplicates(db, folder, data.filenames)}
 
 @app.put("/media/{media_id}")
 async def update_media(
@@ -943,6 +1014,17 @@ def backup_now(data: BackupRequest | None = None, username: str = Depends(verify
     except OSError as e:
         log.exception("Backup failed")
         raise HTTPException(status_code=500, detail=f"Backup failed: {e}")
+
+
+@app.get("/backups/{name}/download")
+async def download_backup(name: str, username: str = Depends(verify_admin)):
+    # resolve() only accepts reztv-backup-*.tar.gz names inside BACKUP_PATH.
+    # FileResponse streams the file in chunks, so multi-GB backups never sit in memory.
+    try:
+        path = backup_svc.resolve(name)
+    except (ValueError, FileNotFoundError):
+        raise HTTPException(status_code=404, detail="Backup not found")
+    return FileResponse(path, media_type="application/gzip", filename=path.name)
 
 
 @app.delete("/backups/{name}")
