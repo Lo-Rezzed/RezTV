@@ -116,16 +116,24 @@ def create_backup(engine, metadata, media_path: str, include_media: bool = True,
                         tar.add(media_path, arcname="media")
                     else:
                         files_total, bytes_total = _media_totals(media_path)
-                        done = {"files": 0, "bytes": 0}
+                        # tarfile calls the filter *before* writing each member, so a
+                        # file counts as done when the next one starts (or at the end).
+                        done = {"files": 0, "bytes": 0, "pending": 0}
 
                         def count(ti):
                             if ti.isfile():
-                                done["files"] += 1
-                                done["bytes"] += ti.size
-                                progress(done["files"], files_total, done["bytes"], bytes_total)
+                                if done["pending"]:
+                                    done["files"] += 1
+                                    done["bytes"] += max(done["pending"], 0)
+                                    progress(done["files"], files_total, done["bytes"], bytes_total)
+                                done["pending"] = ti.size or -1
                             return ti
                         progress(0, files_total, 0, bytes_total)
                         tar.add(media_path, arcname="media", filter=count)
+                        if done["pending"]:
+                            done["files"] += 1
+                            done["bytes"] += max(done["pending"], 0)
+                        progress(done["files"], files_total, done["bytes"], bytes_total)
             os.replace(tmp, final)
         except BaseException:
             tmp.unlink(missing_ok=True)

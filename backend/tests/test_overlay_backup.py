@@ -122,3 +122,16 @@ def test_backup_progress_callback(tmp_path, monkeypatch):
     calls = []
     backup.create_backup(eng, md, str(media), progress=lambda *a: calls.append(a))
     assert calls[0] == (0, 3, 0, 30) and calls[-1] == (3, 3, 30, 30)
+
+
+def test_backup_progress_counts_empty_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(backup, "BACKUP_PATH", str(tmp_path / "b"))
+    eng, md, _ = _db(tmp_path)
+    media = tmp_path / "media"
+    media.mkdir()
+    (media / "empty.mp4").write_bytes(b"")
+    (media / "x.mp4").write_bytes(b"x" * 5)
+    calls = []
+    backup.create_backup(eng, md, str(media), progress=lambda *a: calls.append(a))
+    assert calls[-1] == (2, 2, 5, 5)
+    assert all(c[2] >= 0 for c in calls)
