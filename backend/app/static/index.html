@@ -31,6 +31,13 @@
     .backup-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.9rem; }
     .backup-table td, .backup-table th { text-align: left; padding: 6px; border-bottom: 1px solid #eee; }
     .station-row { display: flex; gap: 10px; align-items: center; margin-top: 10px; }
+    .library-tools { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0; }
+    .library-tools input[type=search] { padding: 7px; width: 260px; }
+    .dup-panel { background: #fff8e1; border: 1px solid #f0d68a; border-radius: 8px; padding: 10px 12px; margin: 10px 0; }
+    .dup-panel li { display: list-item; padding: 2px 0; border: none; }
+    .summary-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.85rem; }
+    .summary-table td, .summary-table th { text-align: left; padding: 5px 6px; border-bottom: 1px solid #eee; vertical-align: top; }
+    .spec-warn { color: #b26a00; }
   </style>
 </head>
 <body>
@@ -51,13 +58,18 @@
     <h2>Upload Video or Audio</h2>
     <form id="uploadForm">
       <input type="file" id="videoFile" multiple accept="video/*,image/gif,.gif,.mkv,audio/*,.mp3,.m4a,.aac,.flac,.wav,.ogg" required>
-      <input type="text" id="uploadFolder" list="folderOptions" placeholder="Folder (optional)">
-      <datalist id="folderOptions"></datalist>
+      <label>Folder <select id="uploadFolder" title="Folder the files go into"></select></label>
+      <input type="text" id="uploadNewFolder" placeholder="New folder name" maxlength="64" style="display:none;"
+        title="Letters, numbers, spaces, - and _ (up to 64 characters)">
+      <button type="button" onclick="createFolder()" title="Make an empty folder now, to fill later">Create folder</button>
       <button type="submit" id="uploadButton">Upload</button>
     </form>
-    <small style="color:#888;">Select several files at once; they upload one after another into the same folder.</small>
+    <small style="color:#888;">Select several files at once; they upload one after another into the same folder.
+      Videos are converted to the station format (constant 30 fps, H.264); see the user guide's "Export settings".</small>
+    <div id="dupPanel" class="dup-panel" style="display:none;"></div>
     <p id="uploadStatus"></p>
     <ul id="uploadQueue" class="upload-queue"></ul>
+    <div id="uploadSummary"></div>
   </section>
 
   <!-- Create Channel -->
@@ -80,7 +92,14 @@
   <!-- Media Library -->
   <section>
     <h2>Media Library</h2>
-    <button onclick="loadMedia()">Refresh Media</button>
+    <div class="library-tools">
+      <button onclick="loadMedia()">Refresh Media</button>
+      <input type="search" id="mediaSearch" placeholder="Search file names..." title="Searches the folder picked on the left, or all media">
+      <label>Sort <select id="mediaSort">
+        <option value="newest">Newest first</option><option value="oldest">Oldest first</option></select></label>
+      <label>Show <select id="mediaPageSize">
+        <option>25</option><option>50</option><option>100</option></select> per page</label>
+    </div>
     <div class="library">
       <div class="folder-sidebar">
         <strong>Folders</strong>
@@ -163,6 +182,76 @@
     // ========== Upload (several files, one after another) ==========
     const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
+
+    // Reads a JSON response. When the body is not JSON (for example a proxy's
+    // 502/504 HTML page) it returns {detail: "HTTP 504 Gateway Time-out"} so the
+    // page can show what actually happened instead of a bare "failed".
+    async function readJson(res) {
+      const text = await res.text().catch(() => "");
+      try { return JSON.parse(text); }
+      catch (_) { return { detail: `HTTP ${res.status}${res.statusText ? " " + res.statusText : ""} (the server did not send a JSON reply)` }; }
+    }
+    const errText = (res, d, fallback) => (d && d.detail
+      ? (typeof d.detail === "string" ? d.detail : JSON.stringify(d.detail)) : `${fallback} (HTTP ${res.status})`);
+
+    // ---- Folder picker
+    const NEW_FOLDER = "::new";  // ":" can never be in a folder name
+    const FOLDER_RE = /^[A-Za-z0-9 _-]{1,64}$/;
+    let knownFolders = [];
+
+    function fillFolderPicker(folders, select) {
+      knownFolders = folders.map(f => f.name);
+      const sel = document.getElementById("uploadFolder");
+      const typingNew = sel.value === NEW_FOLDER && !select;  // keep "New folder..." while the user types
+      const want = select || (sel.value && sel.value !== NEW_FOLDER ? sel.value : localStorage.getItem("reztvUploadFolder")) || "Unsorted";
+      const names = knownFolders.includes("Unsorted") ? [...knownFolders] : ["Unsorted", ...knownFolders];
+      if (!names.includes(want)) names.push(want);
+      sel.innerHTML = names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("") +
+        `<option value="${NEW_FOLDER}">New folder...</option>`;
+      sel.value = typingNew ? NEW_FOLDER : want;
+      const input = document.getElementById("uploadNewFolder");
+      input.style.display = sel.value === NEW_FOLDER ? "" : "none";
+      if (select) input.value = "";
+    }
+
+    function toggleNewFolderInput() {
+      const isNew = document.getElementById("uploadFolder").value === NEW_FOLDER;
+      const input = document.getElementById("uploadNewFolder");
+      input.style.display = isNew ? "" : "none";
+      if (isNew) input.focus();
+    }
+    document.getElementById("uploadFolder").addEventListener("change", e => {
+      if (e.target.value !== NEW_FOLDER) localStorage.setItem("reztvUploadFolder", e.target.value);
+      toggleNewFolderInput();
+    });
+
+    // Returns the chosen folder name, or null (after telling the user) if a new name is invalid.
+    function chosenUploadFolder() {
+      const v = document.getElementById("uploadFolder").value;
+      if (v !== NEW_FOLDER) return v;
+      const name = document.getElementById("uploadNewFolder").value.trim().replace(/\s+/g, " ");
+      if (!FOLDER_RE.test(name)) {
+        alert("Folder names can use letters, numbers, spaces, - and _ (up to 64 characters).");
+        return null;
+      }
+      return name;
+    }
+
+    async function createFolder() {
+      const name = (prompt("New folder name (letters, numbers, spaces, - and _):") || "").trim().replace(/\s+/g, " ");
+      if (!name) return;
+      if (!FOLDER_RE.test(name)) return alert("Folder names can use letters, numbers, spaces, - and _ (up to 64 characters).");
+      const res = await fetch(`${API}/media/folders`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ folder: name })
+      });
+      const d = await readJson(res);
+      if (!res.ok) return alert("Could not create the folder: " + errText(res, d, "error"));
+      if (!d.created) alert(`The folder ${d.name} already exists.`);
+      localStorage.setItem("reztvUploadFolder", d.name);
+      await loadMedia(d.name);
+    }
+
+    // ---- Upload
     function uploadOne(file, folder, row) {
       return new Promise(resolve => {
         const formData = new FormData();
@@ -174,21 +263,89 @@
           if (e.lengthComputable) state.textContent = `uploading ${Math.round(e.loaded / e.total * 100)}%`;
         });
         xhr.addEventListener("load", () => {
-          if (xhr.status >= 200 && xhr.status < 300) {
-            const d = JSON.parse(xhr.responseText);
+          let d = null;
+          try { d = JSON.parse(xhr.responseText); } catch (_) {}
+          if (xhr.status >= 200 && xhr.status < 300 && d) {
             state.innerHTML = `<span class="success">done: ID ${d.id} in ${esc(d.folder)}, converting</span>`;
-            resolve(true);
+            resolve({ ok: true, data: d });
           } else {
-            let detail = "";
-            try { detail = JSON.parse(xhr.responseText).detail || ""; } catch (_) {}
+            const detail = (d && d.detail) ? d.detail : `HTTP ${xhr.status}${xhr.statusText ? " " + xhr.statusText : ""}`;
             state.innerHTML = `<span class="error">failed (${xhr.status}) ${esc(detail)}</span>`;
-            resolve(false);
+            resolve({ ok: false, error: `failed (${xhr.status}): ${detail}` });
           }
         });
-        xhr.addEventListener("error", () => { state.innerHTML = `<span class="error">failed: network error</span>`; resolve(false); });
+        xhr.addEventListener("error", () => {
+          state.innerHTML = `<span class="error">failed: network error</span>`;
+          resolve({ ok: false, error: "network error" });
+        });
         xhr.open("POST", `${API}/upload`);
         xhr.send(formData);
       });
+    }
+
+    // Shows the duplicate warning and resolves with "skip", "all" or "cancel".
+    function askAboutDuplicates(folder, dups, total) {
+      const panel = document.getElementById("dupPanel");
+      const rows = dups.map(d => `<li>${esc(d.filename)} <small style="color:#888;">(already there as ID ${d.ids.join(", ")})</small></li>`).join("");
+      panel.innerHTML = `<strong>${dups.length} of ${total} file${total === 1 ? "" : "s"} already in ${esc(folder)}:</strong>
+        <ul style="margin:6px 0 8px 18px; list-style:disc;">${rows}</ul>
+        <button data-c="skip">Skip duplicates</button>
+        <button data-c="all">Upload anyway</button>
+        <button data-c="cancel">Cancel</button>`;
+      panel.style.display = "block";
+      return new Promise(resolve => {
+        panel.querySelectorAll("button").forEach(b => b.onclick = () => {
+          panel.style.display = "none"; panel.innerHTML = ""; resolve(b.dataset.c);
+        });
+      });
+    }
+
+    const fmtDur = s => s ? `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, "0")}` : "";
+
+    function specNote(d) {
+      if (!d) return "";
+      if (d.kind === "audio") return "audio track";
+      const c = d.conform;
+      if (!c) return "";
+      if (c.action === "reencode") return `Converted to station spec: ${c.reason}`;
+      if (c.action === "audio_fix") return `Picture matches; only the sound is converted (${c.reason})`;
+      return "Matches station spec (no re-encode)";
+    }
+
+    let lastSummary = [];
+    function renderUploadSummary(rows) {
+      lastSummary = rows;
+      const box = document.getElementById("uploadSummary");
+      if (!rows.length) { box.innerHTML = ""; return; }
+      box.innerHTML = `<table class="summary-table"><thead><tr>
+          <th>File</th><th>ID</th><th>Folder</th><th>Result</th><th>Spec note</th><th>Length</th></tr></thead><tbody>
+        ${rows.map(r => `<tr><td>${esc(r.filename)}</td><td>${r.id ?? ""}</td><td>${esc(r.folder)}</td>
+          <td class="${r.result === "uploaded" ? "success" : r.result.startsWith("skipped") ? "" : "error"}">${esc(r.result)}${r.error ? ": " + esc(r.error) : ""}</td>
+          <td class="${r.converted ? "spec-warn" : ""}">${r.converted ? "&#9888; " : ""}${esc(r.spec)}</td><td>${esc(r.length)}</td></tr>`).join("")}
+        </tbody></table>
+        <button type="button" onclick="copySummaryCsv(this)">Copy as CSV</button>
+        <textarea id="summaryCsv" readonly style="display:none; width:100%; height:8em; font-size:0.8rem;"></textarea>`;
+    }
+
+    function summaryCsv(rows) {
+      const cell = v => { const t = String(v ?? ""); return /[",\n\r]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; };
+      const head = ["filename", "id", "folder", "result", "error", "spec_note", "duration_seconds"];
+      return [head, ...rows.map(r => [r.filename, r.id, r.folder, r.result, r.error, r.spec, r.duration ?? ""])]
+        .map(line => line.map(cell).join(",")).join("\r\n") + "\r\n";
+    }
+
+    async function copySummaryCsv(btn) {
+      const csv = summaryCsv(lastSummary);
+      try {
+        await navigator.clipboard.writeText(csv);
+        btn.textContent = "Copied!";
+        setTimeout(() => btn.textContent = "Copy as CSV", 1500);
+      } catch (_) {
+        // Clipboard API needs HTTPS or permission; fall back to a selectable box.
+        const ta = document.getElementById("summaryCsv");
+        ta.value = csv; ta.style.display = "block"; ta.select();
+        btn.textContent = "Press Ctrl+C / Cmd+C to copy";
+      }
     }
 
     document.getElementById("uploadForm").addEventListener("submit", async (e) => {
@@ -197,22 +354,70 @@
       const status = document.getElementById("uploadStatus");
       const queue = document.getElementById("uploadQueue");
       const button = document.getElementById("uploadButton");
-      const files = [...fileInput.files];
+      let files = [...fileInput.files];
       if (!files.length) { status.innerHTML = "Please select a file first."; return; }
-      const folder = document.getElementById("uploadFolder").value.trim();
+      const folder = chosenUploadFolder();
+      if (folder === null) return;
+      button.disabled = true;
+      renderUploadSummary([]);
+      const summary = [];
+
+      // Warn about names already in the target folder before anything is sent.
+      status.textContent = "Checking for duplicates...";
+      try {
+        const res = await fetch(`${API}/media/duplicates`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ folder, filenames: files.map(f => f.name) })
+        });
+        const d = await readJson(res);
+        if (res.ok && d.duplicates.length) {
+          status.textContent = "Some files are already in this folder; choose what to do above.";
+          const choice = await askAboutDuplicates(d.folder, d.duplicates, files.length);
+          if (choice === "cancel") { status.textContent = "Upload cancelled."; button.disabled = false; return; }
+          if (choice === "skip") {
+            const dupNames = new Set(d.duplicates.map(x => x.filename.toLowerCase()));
+            files.filter(f => dupNames.has(f.name.toLowerCase())).forEach(f => {
+              const ids = d.duplicates.find(x => x.filename.toLowerCase() === f.name.toLowerCase()).ids;
+              summary.push({ filename: f.name, id: null, folder: d.folder, result: "skipped (duplicate)",
+                error: `already in folder as ID ${ids.join(", ")}`, spec: "", length: "" });
+            });
+            files = files.filter(f => !dupNames.has(f.name.toLowerCase()));
+          }
+        } else if (!res.ok) {
+          status.innerHTML = `<span class="error">Duplicate check failed: ${esc(errText(res, d, "error"))}</span> Uploading anyway.`;
+        }
+      } catch (err) {
+        status.innerHTML = `<span class="error">Duplicate check failed (${esc(err.message)}).</span> Uploading anyway.`;
+      }
+
       queue.innerHTML = files.map((f, i) =>
         `<li id="upq-${i}"><strong>${esc(f.name)}</strong> <span class="state" style="color:#888;">waiting</span></li>`).join("");
-      button.disabled = true;
       let ok = 0;
       for (let i = 0; i < files.length; i++) {
         status.textContent = `Uploading ${i + 1} of ${files.length}...`;
-        if (await uploadOne(files[i], folder, document.getElementById(`upq-${i}`))) ok++;
+        const r = await uploadOne(files[i], folder, document.getElementById(`upq-${i}`));
+        if (r.ok) {
+          ok++;
+          const d = r.data;
+          summary.push({ filename: files[i].name, id: d.id, folder: d.folder, result: "uploaded", error: "",
+            spec: specNote(d), converted: !!(d.conform && d.conform.converted), duration: d.duration, length: fmtDur(d.duration) });
+        } else {
+          summary.push({ filename: files[i].name, id: null, folder, result: "failed", error: r.error, spec: "", length: "" });
+        }
       }
       button.disabled = false;
       fileInput.value = "";
-      status.innerHTML = `<span class="${ok === files.length ? "success" : "error"}">${ok} of ${files.length} uploaded.</span>
-        Uploads are converted to the station format; they can be added to a channel once they show "ready".`;
-      loadMedia();
+      queue.innerHTML = "";
+      const skipped = summary.filter(r => r.result.startsWith("skipped")).length;
+      const converted = summary.filter(r => r.converted).length;
+      const skippedText = skipped ? `${skipped} duplicate${skipped === 1 ? "" : "s"} skipped` : "";
+      status.innerHTML = `<span class="${ok === files.length ? "success" : "error"}">${files.length
+          ? `${ok} of ${files.length} uploaded${skipped ? ", " + skippedText : ""}` : `Nothing uploaded; ${skippedText}`}.</span>
+        ${converted ? `<span class="spec-warn">&#9888; ${converted} video${converted === 1 ? " does" : "s do"} not match the station spec and will be re-encoded (see Spec note).</span>` : ""}
+        Uploads can be added to a channel once they show "ready".`;
+      renderUploadSummary(summary);
+      if (document.getElementById("uploadFolder").value === NEW_FOLDER) localStorage.setItem("reztvUploadFolder", folder);
+      loadMedia(document.getElementById("uploadFolder").value === NEW_FOLDER ? folder : undefined);
     });
 
     // ========== Create Channel ==========
@@ -238,19 +443,35 @@
 
     // ========== Load Media (collapsible folders, paged) ==========
     let currentFolder = "";  // "" means all folders
-    const PAGE_SIZE = 25;
+    const libSort = document.getElementById("mediaSort");
+    const libPageSize = document.getElementById("mediaPageSize");
+    const libSearch = document.getElementById("mediaSearch");
+    libSort.value = localStorage.getItem("reztvMediaSort") || "newest";
+    libPageSize.value = localStorage.getItem("reztvMediaPageSize") || "25";
+    const pageSize = () => parseInt(libPageSize.value, 10) || 25;
+    let searchPage = 1;
+    const resetPages = () => { Object.keys(folderPages).forEach(k => delete folderPages[k]); searchPage = 1; };
+    libSort.addEventListener("change", () => { localStorage.setItem("reztvMediaSort", libSort.value); resetPages(); loadMedia(); });
+    libPageSize.addEventListener("change", () => { localStorage.setItem("reztvMediaPageSize", libPageSize.value); resetPages(); loadMedia(); });
+    let searchTimer;
+    libSearch.addEventListener("input", () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => { searchPage = 1; loadMedia(); }, 300);
+    });
     const folderPages = {};  // folder -> current page
     const openFolders = new Set(JSON.parse(localStorage.getItem("reztvOpenFolders") || "[]"));
     let libraryPlaylists = [];
 
     function selectFolder(name) {
       currentFolder = name;
+      searchPage = 1;
       loadMedia();
     }
 
     function saveOpenFolders() { localStorage.setItem("reztvOpenFolders", JSON.stringify([...openFolders])); }
 
-    async function loadMedia() {
+    // `pickFolder`: select this folder in the upload picker (after creating one).
+    async function loadMedia(pickFolder) {
       const [playlists, folders] = await Promise.all([
         fetch(`${API}/playlists`).then(r => r.json()),
         fetch(`${API}/media/folders`).then(r => r.json())
@@ -265,7 +486,7 @@
       folderList.innerHTML = `<li class="${currentFolder === "" ? "active" : ""}" data-folder="">All media (${total})</li>` +
         folders.map(f => `<li class="${currentFolder === f.name ? "active" : ""}" data-folder="${esc(f.name)}">${esc(f.name)} (${f.count})</li>`).join("");
       folderList.querySelectorAll("li").forEach(li => li.onclick = () => selectFolder(li.dataset.folder));
-      document.getElementById("folderOptions").innerHTML = folders.map(f => `<option value="${esc(f.name)}">`).join("");
+      fillFolderPicker(folders, pickFolder);
 
       // "Add whole folder to channel" bar
       const folderBar = document.getElementById("folderBar");
@@ -275,7 +496,47 @@
         `<option value="">Select channel...</option>` + playlists.map(p => `<option value="${p.id}">${esc(p.name)}</option>`).join("");
 
       const list = document.getElementById("mediaList");
-      if (folders.length === 0) { list.innerHTML = "<li>No media uploaded yet</li>"; return; }
+      if (libSearch.value.trim()) { await loadSearchPage(); }
+      else if (folders.length === 0) { list.innerHTML = "<li>No media uploaded yet</li>"; return; }
+      else renderFolderGroups(folders, list);
+
+      if (folders.some(f => f.converting)) {
+        clearTimeout(window._convPoll);
+        window._convPoll = setTimeout(loadMedia, 5000);
+      }
+    }
+
+    function pagerHtml(d) {
+      if (d.pages <= 1) return d.total > 0 ? `${d.total} item${d.total === 1 ? "" : "s"}` : "";
+      const first = (d.page - 1) * d.page_size + 1, last = Math.min(d.page * d.page_size, d.total);
+      return `<button ${d.page <= 1 ? "disabled" : ""} data-go="${d.page - 1}">&lsaquo; Prev</button>
+        ${first}&ndash;${last} of ${d.total} (page ${d.page} of ${d.pages})
+        <button ${d.page >= d.pages ? "disabled" : ""} data-go="${d.page + 1}">Next &rsaquo;</button>`;
+    }
+
+    // Search results: one flat, paged list across all folders (or the folder picked on the left).
+    let searchGen = 0;
+    async function loadSearchPage(page) {
+      const gen = ++searchGen;
+      if (page) searchPage = page;
+      const q = libSearch.value.trim();
+      const params = new URLSearchParams({ q, page: searchPage, page_size: pageSize(), sort: libSort.value });
+      if (currentFolder) params.set("folder", currentFolder);
+      const res = await fetch(`${API}/media?${params}`);
+      const d = await readJson(res);
+      if (gen !== searchGen) return;
+      const list = document.getElementById("mediaList");
+      if (!res.ok) { list.innerHTML = `<li class="error">Search failed: ${esc(errText(res, d, "error"))}</li>`; return; }
+      searchPage = d.page;
+      list.innerHTML = `<div class="folder-group"><div class="pager"><strong>${d.total} match${d.total === 1 ? "" : "es"}</strong>
+          for &ldquo;${esc(q)}&rdquo; in ${currentFolder ? esc(currentFolder) : "all folders"}</div>
+          <ul class="folder-items" style="padding:0 12px;">${d.items.length
+            ? d.items.map(m => renderMediaItem(m, libraryPlaylists, true)).join("") : "<li>No matching files</li>"}</ul>
+          <div class="pager">${pagerHtml(d)}</div></div>`;
+      list.querySelectorAll(".pager button").forEach(b => b.onclick = () => loadSearchPage(parseInt(b.dataset.go, 10)));
+    }
+
+    function renderFolderGroups(folders, list) {
 
       // One collapsible group per folder. With a folder picked in the sidebar only that one shows, open.
       const shown = currentFolder ? folders.filter(f => f.name === currentFolder) : folders;
@@ -296,34 +557,24 @@
         list.appendChild(det);
         if (det.open) loadFolderPage(det);
       }
-
-      if (folders.some(f => f.converting)) {
-        clearTimeout(window._convPoll);
-        window._convPoll = setTimeout(loadMedia, 5000);
-      }
     }
 
     async function loadFolderPage(det, page) {
       const folder = det.dataset.folder;
       if (page) folderPages[folder] = page;
-      const res = await fetch(`${API}/media?folder=${encodeURIComponent(folder)}&page=${folderPages[folder] || 1}&page_size=${PAGE_SIZE}`);
-      const d = await res.json();
+      const params = new URLSearchParams({ folder, page: folderPages[folder] || 1, page_size: pageSize(), sort: libSort.value });
+      const res = await fetch(`${API}/media?${params}`);
+      const d = await readJson(res);
+      if (!res.ok) { det.querySelector(".folder-items").innerHTML = `<li class="error">${esc(errText(res, d, "Could not load"))}</li>`; return; }
       folderPages[folder] = d.page;
       det.querySelector(".folder-items").innerHTML = d.items.length
         ? d.items.map(m => renderMediaItem(m, libraryPlaylists)).join("") : "<li>Empty folder</li>";
       const pager = det.querySelector(".pager");
-      if (d.pages > 1) {
-        const first = (d.page - 1) * d.page_size + 1, last = Math.min(d.page * d.page_size, d.total);
-        pager.innerHTML = `<button ${d.page <= 1 ? "disabled" : ""} data-go="${d.page - 1}">&lsaquo; Prev</button>
-          ${first}&ndash;${last} of ${d.total} (page ${d.page} of ${d.pages})
-          <button ${d.page >= d.pages ? "disabled" : ""} data-go="${d.page + 1}">Next &rsaquo;</button>`;
-        pager.querySelectorAll("button").forEach(b => b.onclick = () => loadFolderPage(det, parseInt(b.dataset.go, 10)));
-      } else {
-        pager.innerHTML = "";
-      }
+      pager.innerHTML = d.pages > 1 ? pagerHtml(d) : "";
+      pager.querySelectorAll("button").forEach(b => b.onclick = () => loadFolderPage(det, parseInt(b.dataset.go, 10)));
     }
 
-    function renderMediaItem(m, playlists) {
+    function renderMediaItem(m, playlists, showFolder) {
       const colors = { ready: "#2a7", pending: "#888", converting: "#c80", failed: "#c00" };
       const fmt = s => s ? `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}` : "";
       const ready = m.status === "ready";
@@ -332,7 +583,8 @@
       // Videos can go on any channel; audio tracks only into a separate-audio channel's music list.
       const targets = isAudio ? playlists.filter(p => HAS_AUDIO_LIST(p.mode)) : playlists;
       const options = targets.map(p => `<option value="${p.id}">${esc(p.name)}${isAudio ? " (audio playlist)" : ""}</option>`).join("");
-      const kindTag = isAudio ? `<span style="color:#06c; font-size:0.85rem;">&#9835; audio</span>` : "";
+      const kindTag = (isAudio ? `<span style="color:#06c; font-size:0.85rem;">&#9835; audio</span>` : "") +
+        (showFolder ? ` <span style="color:#888; font-size:0.85rem;">in ${esc(m.folder)}</span>` : "");
       return `
         <li>
           <span>ID ${m.id}: ${esc(m.original_filename || m.filename)} ${kindTag} ${badge} <span style="color:#888; font-size:0.85rem;">${ready ? fmt(m.duration) : ""}</span>${m.status === "failed" && m.error ? `<br><small style="color:#c00;">${esc(m.error)}</small>` : ""}</span>
@@ -569,27 +821,91 @@
       body.innerHTML = d.backups.length ? d.backups.map(b => `
         <tr><td>${esc(b.name)} ${b.scheduled ? '<small style="color:#888;">(scheduled)</small>' : ""}${b.pre_restore ? '<small style="color:#888;">(saved before a restore, no media)</small>' : ""}</td>
           <td>${fmtSize(b.size)}</td><td>${esc(b.created.replace("T", " "))}</td>
-          <td><button data-restore="${esc(b.name)}">Restore</button>
+          <td><a href="${API}/backups/${encodeURIComponent(b.name)}/download" download="${esc(b.name)}" title="Save a copy of this backup on this computer">Download</a>
+              <button data-restore="${esc(b.name)}">Restore</button>
               <button data-delete="${esc(b.name)}" style="background:#ffdddd; color:#c00;">Delete</button></td></tr>`).join("")
         : `<tr><td colspan="4" style="color:#888;">No backups yet</td></tr>`;
       body.querySelectorAll("[data-restore]").forEach(b => b.onclick = () => restoreBackup(b.dataset.restore));
       body.querySelectorAll("[data-delete]").forEach(b => b.onclick = () => deleteBackup(b.dataset.delete));
+      // A backup started earlier (or from another tab) is still running: follow it.
+      if (d.job && d.job.state === "running" && !backupPolling) pollBackupJob(d.job.id);
+    }
+
+    // "Back up now" starts a background job on the server; the page polls it.
+    let backupPolling = false;
+    function backupProgressText(j) {
+      if (!j.include_media) return "Backing up the database...";
+      if (j.files_total == null) return "Backing up the database...";
+      if (!j.files_total) return "Backing up (no media files)...";
+      return `Backing up... ${j.files_done} of ${j.files_total} media files` +
+        (j.bytes_total ? ` (${fmtSize(j.bytes_done || 0)} of ${fmtSize(j.bytes_total)}, ${Math.floor(100 * j.bytes_done / j.bytes_total)}%)` : "");
+    }
+
+    async function pollBackupJob(id) {
+      const status = document.getElementById("backupStatus");
+      const btn = document.getElementById("backupNowBtn");
+      backupPolling = true;
+      btn.disabled = true;
+      let misses = 0;
+      try {
+        while (true) {
+          let res, j;
+          try {
+            res = await fetch(`${API}/backups/jobs/${encodeURIComponent(id)}`);
+            j = await readJson(res);
+          } catch (err) { res = null; j = { detail: err.message }; }
+          if (res && res.ok) {
+            misses = 0;
+            if (j.state === "done") {
+              status.innerHTML = `<span class="success">Saved ${esc(j.name)} (${fmtSize(j.size)})</span>`;
+              break;
+            }
+            if (j.state === "error") {
+              status.innerHTML = `<span class="error">Backup failed: ${esc(j.error)}</span>`;
+              break;
+            }
+            status.textContent = backupProgressText(j);
+          } else if (res && res.status === 404) {
+            status.innerHTML = `<span class="error">${esc(errText(res, j, "Backup job not found"))}</span>`;
+            break;
+          } else if (++misses >= 5) {  // tolerate a few hiccups (proxy restart, network blip)
+            status.innerHTML = `<span class="error">Lost track of the backup: ${esc(res ? errText(res, j, "error") : j.detail)}. ` +
+              "It may still finish; reload the page in a while.</span>";
+            break;
+          }
+          await new Promise(r => setTimeout(r, 2000));
+        }
+      } finally {
+        backupPolling = false;
+        btn.disabled = false;
+        loadBackups();
+      }
     }
 
     async function backupNow() {
       const status = document.getElementById("backupStatus");
       const btn = document.getElementById("backupNowBtn");
       btn.disabled = true;
-      status.textContent = "Backing up... (with media this can take a while)";
-      const res = await fetch(`${API}/backups`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ include_media: document.getElementById("backupNowMedia").checked })
-      });
-      const d = await res.json().catch(() => ({}));
-      btn.disabled = false;
-      status.innerHTML = res.ok ? `<span class="success">Saved ${esc(d.name)} (${fmtSize(d.size)})</span>`
-        : `<span class="error">${esc(d.detail || "Backup failed")}</span>`;
-      loadBackups();
+      status.textContent = "Starting backup...";
+      let res, d;
+      try {
+        res = await fetch(`${API}/backups`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ include_media: document.getElementById("backupNowMedia").checked })
+        });
+        d = await readJson(res);
+      } catch (err) {
+        btn.disabled = false;
+        status.innerHTML = `<span class="error">Backup failed: ${esc(err.message)}</span>`;
+        return;
+      }
+      if (!res.ok) {
+        btn.disabled = false;
+        status.innerHTML = `<span class="error">${res.status === 409 ? "" : "Backup failed: "}${esc(errText(res, d, "Backup failed"))}</span>`;
+        return;
+      }
+      status.textContent = backupProgressText(d.job);
+      pollBackupJob(d.job.id);
     }
 
     async function saveBackupSettings() {
@@ -618,17 +934,19 @@
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name, confirm: typed.trim() })
       });
-      const d = await res.json().catch(() => ({}));
+      const d = await readJson(res);
       status.innerHTML = res.ok
         ? `<span class="success">Restored ${esc(d.restored)} (${d.media_files} media files). Previous state saved as ${esc(d.safety_backup)}.</span>`
-        : `<span class="error">${esc(d.detail || "Restore failed")}</span>`;
+        : `<span class="error">Restore failed: ${esc(errText(res, d, "error"))}` +
+          (res.status === 504 || res.status === 502
+            ? ". The proxy stopped waiting, but the restore may still be running on the server; reload the page in a few minutes." : "") + "</span>";
       loadStationName(); loadMedia(); loadPlaylists(); loadBackups();
     }
 
     async function deleteBackup(name) {
       if (!confirm(`Delete backup ${name}? This cannot be undone.`)) return;
       const res = await fetch(`${API}/backups/${encodeURIComponent(name)}`, { method: "DELETE" });
-      if (!res.ok) alert("Failed to delete backup");
+      if (!res.ok) alert("Failed to delete backup: " + errText(res, await readJson(res), "error"));
       loadBackups();
     }
 
