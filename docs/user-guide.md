@@ -16,16 +16,70 @@
 
 1. Go to the **Upload Video or Audio** section
 2. Select a video file (MP4, MOV, MKV or WebM), an animated GIF, or an audio file (MP3, M4A, AAC, FLAC, WAV or OGG), up to 2 GB
-3. Optionally type a folder name (or pick an existing one). Leave it blank and the video goes in **Unsorted**
-4. Click **Upload**. A progress bar will show the upload status
-5. After uploading, the video appears in the Media Library under its folder with the status **pending**, then **converting**
-6. RezTV converts it to the station format (see [Preparing videos](preparing-videos.md)). The list refreshes itself, and when the status reads **ready** the video shows its length and can be added to a channel
-7. Audio files are marked **♫ audio** in the Media Library. They are converted to AAC, 44.1 kHz stereo, with the volume evened out, and can only be added to the audio playlist of a channel in **Separate audio** mode
-8. If the status reads **failed**, the reason is shown under the video. Click **Retry**, or delete it and upload a different copy
+3. Pick a folder from the **Folder** list (it remembers the one you used last; **Unsorted** is the default). To start a new folder, choose **New folder...** and type its name, or click **Create folder** to make an empty folder now and fill it later
+4. Click **Upload**. If any of the files are already in that folder (same file name, ignoring upper/lower case), RezTV lists them first and asks: **Skip duplicates**, **Upload anyway** or **Cancel**. Each file then shows its upload progress
+5. When all files are done, an **upload summary** table lists each file with its media ID, folder, result (uploaded, skipped or the error) and a **spec note**: whether the video already matches the station format or will be converted (and why, e.g. "frame rate 29.970 (station 30)"). Click **Copy as CSV** to paste the table into a spreadsheet or a note
+6. After uploading, the video appears in the Media Library under its folder with the status **pending**, then **converting**
+7. RezTV converts it to the station format (see [Preparing videos](preparing-videos.md)). The list refreshes itself, and when the status reads **ready** the video shows its length and can be added to a channel
+8. Audio files are marked **♫ audio** in the Media Library. They are converted to AAC, 44.1 kHz stereo, with the volume evened out, and can only be added to the audio playlist of a channel in **Separate audio** mode
+9. If the status reads **failed**, the reason is shown under the video. Click **Retry**, or delete it and upload a different copy
+
+## Export settings
+
+RezTV converts anything you upload, but files that already match the station
+format go on air faster and look better, because they are only copied, not
+re-encoded. For clips you make yourself (for example in iMovie), export them like
+this:
+
+| Setting | Use | Not |
+|---|---|---|
+| Frame rate | **30 fps, constant** | 29.97 fps, 60 fps, or "variable"/"automatic" |
+| Video codec | **H.264** | HEVC/H.265, ProRes |
+| Pixel format | **yuv420p** (8-bit 4:2:0) | 10-bit, 4:2:2, 4:4:4 |
+| Size | **1280x720** (the size this station is set to in `STATION_RESOLUTION`; match yours if it differs) | other sizes are re-encoded and letterboxed to fit |
+| Loops | **exactly 8 seconds** (240 frames at 30 fps) | 7.99 s or 8.01 s |
+| Sound | AAC stereo 44.1 kHz, or none (a silent track is added) | |
+
+**Why constant 30 and not 29.97?** The station plays at exactly 30 frames per
+second. A 29.97 fps clip (what many editors, including iMovie, export by default)
+or a variable-frame-rate clip is re-encoded on upload, and to get from 29.97 to 30
+a frame is repeated now and then. In a short loop that can show as a small hitch.
+RezTV only skips the re-encode when the clip's nominal and average frame rates are
+both exactly 30/1, and codec, pixel format and size match too. The upload summary
+tells you which files were converted and why.
+
+**iMovie exports: use Shutter Encoder.** iMovie exports often come out at
+29.97 fps or with a variable frame rate, which RezTV then re-encodes. The tested
+route is to export from iMovie at the best quality, then
+convert the file with [Shutter Encoder](https://www.shutterencoder.com) (free, Mac
+and Windows):
+
+1. Drop the iMovie export into Shutter Encoder and choose the **H.264** function.
+2. Set the resolution to **1280x720**.
+3. Under **Advanced features**, tick **Conform by**, set the frame rate to **30**
+   and pick a mode. For an 8 second loop exported at 29.97, **Speed** keeps every
+   frame and plays them 0.1% faster, so the loop stays seamless and lasts exactly
+   8.000 s. **Blending** keeps the original length instead.
+4. Keep the colour format at 8-bit 4:2:0 (yuv420p; don't pick a 10-bit or 4:2:2
+   option), then click **Start function**.
+
+Menu names can differ slightly between Shutter Encoder versions. To check a
+finished file before uploading (if you have ffmpeg installed):
+
+```bash
+ffprobe -v error -select_streams v:0 \
+  -show_entries stream=codec_name,pix_fmt,width,height,r_frame_rate,avg_frame_rate,nb_frames \
+  -of default=nw=1 loop.mp4
+```
+
+You want `codec_name=h264`, `pix_fmt=yuv420p`, `width=1280`, `height=720`,
+`r_frame_rate=30/1`, `avg_frame_rate=30/1` and, for an 8 second loop,
+`nb_frames=240`. See also [Preparing videos](preparing-videos.md).
 
 ## Media Folders
 
 - The **Folders** list on the left of the Media Library shows every folder and how many videos it holds. Click one to see only those videos, or **All media** to see everything
+- **Create folder** (in the upload section) makes an empty folder straight away, so you can set up folders before uploading. An empty folder is kept as an empty directory on the server and shows with (0) items
 - To move a video, click **Move** next to it and type the folder name. Typing a new name creates that folder
 - Folder names can use letters, numbers, spaces, `-` and `_`. Anything else is removed
 - New uploads are stored on the server under `media/<folder name>/`. Moving a video only changes its folder in the admin panel; the file stays where it is, so a channel that is playing it is not interrupted
@@ -143,19 +197,34 @@ show nothing.
   with what plays. `OVERLAY_OPACITY` (default 0.6) and `OVERLAY_FONT` in `.env`
   change the look.
 
-## Media library: folders and pages
+## Media library: folders, pages, search and sorting
 
 The library shows one collapsible group per folder. Click a folder's name to open
-or close it; the page remembers which folders you left open. Each folder shows 25
-items at a time, with Prev/Next buttons. Clicking a folder in the sidebar shows only
-that folder, already open, with the "Add folder to channel" bar.
+or close it; the page remembers which folders you left open. Each folder shows one
+page of items at a time, with Prev/Next buttons. Clicking a folder in the sidebar
+shows only that folder, already open, with the "Add folder to channel" bar.
+
+Above the library:
+
+- **Search file names**: type part of a file name (or title). Results show as one
+  list across all folders, each with the folder it is in. If a folder is picked in
+  the sidebar, only that folder is searched; click **All media** to search
+  everything. Upper/lower case does not matter. Clear the box to go back to the
+  folder view.
+- **Sort**: **Newest first** (the default, most recent uploads at the top) or
+  **Oldest first**.
+- **Show 25 / 50 / 100 per page**.
+
+The page remembers your sort and page size in this browser.
 
 ## Uploading several files
 
 In **Upload Video or Audio**, select several files at once (Ctrl/Cmd- or
 Shift-click in the file picker). They all go to the folder you type (optional) and
 upload one after another, each with its own line showing progress and the result
-(ID or error). A failed file does not stop the rest.
+(ID or error). A failed file does not stop the rest. Duplicates are checked before
+anything is sent, and the summary table at the end covers the whole batch,
+including skipped duplicates (see [Uploading Videos and Music](#uploading-videos-and-music)).
 
 ## Station backup and restore
 
@@ -165,8 +234,21 @@ A backup is one `.tar.gz` file in the backups folder (`./backups` next to
 - `database.json`: every channel, playlist, audio playlist, setting and media entry.
 - `media/`: every media file (optional; leave it out for a small, quick backup).
 
-**Back up now** makes a backup right away. With media included this can take a
-while and needs free disk space about the size of your media folder.
+**Back up now** starts a backup right away. It runs in the background on the
+server: the page shows progress (media files and bytes written) and, when it is
+done, the new file's name, and the list refreshes. You can leave or reload the
+page; it picks up a backup that is still running. With media included this can
+take a while and needs free disk space about the size of your media folder.
+
+Only one backup or restore runs at a time. Starting another while one is running
+says so ("A backup or restore is already running") instead of queueing it. If
+something between your browser and the station (such as nginx) answers with an
+error page instead of RezTV, the page shows its HTTP status (for example
+"HTTP 504 Gateway Timeout") rather than a bare "failed".
+
+**Download** next to a backup saves a copy to your computer (you need to be
+logged in to the admin page). This is the easiest way to keep a copy off the
+server.
 
 **Scheduled backups**: set *every N hours* (0 turns it off), how many to keep, and
 whether to include media, then **Save Schedule**. The station checks once a minute
@@ -186,6 +268,14 @@ Files in the media folder that are not in the backup are left in place (they are
 just not listed in the library anymore). To move a station to a new server, copy
 a backup file into the new server's `backups` folder and restore it there.
 
-Keep copies of important backups off the server too (for example with `scp` or
+Keep copies of important backups off the server too (use **Download**, or `scp` /
 `rsync` from the `backups` folder), since a backup on the same disk does not help
 if that disk fails.
+
+**Restore still runs while you wait.** Unlike Back up now, a restore keeps the
+browser request open until it finishes, and restoring a backup with media can take
+minutes. If RezTV is behind nginx, make sure `proxy_read_timeout` is long enough
+(the [domain and SSL guide](domain-ssl.md) uses `600s`; raise it for very large
+media folders). nginx's default is 60 seconds: with that, the page reports
+"HTTP 504" after a minute while the restore carries on on the server. Wait a few
+minutes and reload the page before trying anything else.

@@ -51,7 +51,7 @@ server {
 }
 ```
 
-`proxy_read_timeout` only covers the upload itself. Conversion happens afterwards in the background, so large files don't need a longer timeout.
+`proxy_read_timeout` covers how long nginx waits for RezTV to answer a request (its default is only 60 seconds). Uploads need it while the file is being received; conversion happens afterwards in the background, so large files don't need a longer timeout for that. **Back up now** also runs in the background and answers at once. **Restore** is the exception: it answers only when the restore has finished, which can take several minutes with a large media folder, so keep `proxy_read_timeout` at `600s` or raise it (for example `1800s`) if restores report "HTTP 504". Reload nginx after changing it (`nginx -t && systemctl reload nginx`).
 
 Enable the site:
 
