@@ -80,7 +80,7 @@ You want `codec_name=h264`, `pix_fmt=yuv420p`, `width=1280`, `height=720`,
 
 - The **Folders** list on the left of the Media Library shows every folder and how many videos it holds. Click one to see only those videos, or **All media** to see everything
 - **Create folder** (in the upload section) makes an empty folder straight away, so you can set up folders before uploading. An empty folder is kept as an empty directory on the server and shows with (0) items
-- To move a video, click **Move** next to it and type the folder name. Typing a new name creates that folder
+- To move a video, click **Move** next to it and pick the folder from the list. Choose **New folder...** and type a name to create one
 - Folder names can use letters, numbers, spaces, `-` and `_`. Anything else is removed
 - New uploads are stored on the server under `media/<folder name>/`. Moving a video only changes its folder in the admin panel; the file stays where it is, so a channel that is playing it is not interrupted
 - Videos uploaded before folders existed are shown in **Unsorted** and keep working
@@ -91,8 +91,8 @@ You want `codec_name=h264`, `pix_fmt=yuv420p`, `width=1280`, `height=720`,
 2. Enter a name for the channel
 3. Choose how the channel plays sound:
    - **Standard**: each video plays with its own sound. This is how RezTV has always worked
-   - **Separate audio**: the channel has two playlists, one of videos and one of music. Both loop on their own and RezTV plays them together: the videos are shown muted and the music plays over them. A song keeps playing when the video changes, and a video keeps playing when the song changes
-   - **Mixed**: the channel alternates between finished programs and filler blocks: program 1, then a filler block, then program 2, then a filler block, and so on. Programs are the channel's video playlist and play with their own sound. A filler block shuffles the ready videos from one media folder (the **filler clips folder**), muted, with the channel's audio playlist playing over them, for a set time (**filler block length**, default 30 minutes). Set both when you create the channel, or later with **Filler Settings**
+   - **Separate audio**: the channel has two playlists, one of videos and one of music. RezTV plays them together: the videos loop, shown muted, and the music plays over them in sessions of whole songs (see [Music rotation](#music-rotation-whole-songs-shuffle-and-repeat-protection)). A song keeps playing when the video changes, and a video keeps playing when the song changes
+   - **Mixed**: the channel alternates between finished programs and filler blocks: program 1, then a filler block, then program 2, then a filler block, and so on. Programs are the channel's video playlist and play with their own sound. A filler block shuffles the ready videos from one media folder (the **filler clips folder**), muted, with the channel's music playing over them, for about a set time (**filler block length**, default 30 minutes). A block is made of whole songs, so it ends when its last song ends, never in the middle of one. Set both when you create the channel, or later with **Filler Settings**
 4. Click **Create Channel**
 5. The new channel will also appear on the public landing page
 
@@ -117,6 +117,19 @@ On a **Mixed** channel: with no filler folder (or no music) set, programs play b
 3. Or open a folder and click **Add Folder to Channel**: on a Separate audio channel, the folder's videos go to the video playlist and its music to the audio playlist
 4. In the Channels section, the **♫ Audio playlist** appears under the videos. Drag tracks to reorder them and click **Remove** to take one off. As with videos, restart the stream to apply changes
 5. A Separate audio channel needs at least one ready video and one ready track to start
+
+### Folder playlists
+
+Instead of a hand-made list, a channel can play every track in one media folder.
+Click **Music Settings** on the channel and pick the folder under **Music source**.
+Tracks uploaded or moved into that folder later join the rotation automatically
+(from the next song block or music session, no restart needed), and tracks moved
+out or disabled leave it. The hand-made list is kept but not used while a folder is
+picked; choose **This channel's audio list** to go back to it.
+
+**Tracks in Rotation** on the channel shows what the channel will actually play:
+every track of its music source, with disabled and not-ready ones greyed out, and
+the total length.
 
 ## Adding Videos to a Channel
 
@@ -211,11 +224,16 @@ Above the library:
   the sidebar, only that folder is searched; click **All media** to search
   everything. Upper/lower case does not matter. Clear the box to go back to the
   folder view.
-- **Sort**: **Newest first** (the default, most recent uploads at the top) or
-  **Oldest first**.
+- **Sort**: **Newest first** (the default, most recent uploads at the top),
+  **Oldest first**, or **Title A-Z**.
+- **Type**: show **All**, only **Video** or only **Audio**.
+- **Lyrics**: show only audio tracks tagged **With vocals**, **Instrumental**, or
+  **Not tagged** (see [Track tags](#enabling-disabling-and-tagging-tracks)).
 - **Show 25 / 50 / 100 per page**.
 
-The page remembers your sort and page size in this browser.
+The page remembers your sort, filters and page size in this browser. The
+folder counts in the sidebar always count everything; the filters apply to the
+items listed.
 
 ## Uploading several files
 
@@ -279,3 +297,67 @@ minutes. If RezTV is behind nginx, make sure `proxy_read_timeout` is long enough
 media folders). nginx's default is 60 seconds: with that, the page reports
 "HTTP 504" after a minute while the restore carries on on the server. Wait a few
 minutes and reload the page before trying anything else.
+
+## Music rotation: whole songs, shuffle and repeat protection
+
+Songs always play to their natural end. RezTV plans music in whole songs:
+
+- **Mixed channels**: each filler block is a set of whole songs adding up as
+  close as possible to the filler block length. The block ends when its last song
+  ends, then the next program starts. A song longer than the block length plays on
+  its own, so that block runs long.
+- **Separate audio channels**: music plays in sessions of whole songs of about an
+  hour each (`AUDIO_SESSION_MINUTES` in `.env`, default 60), back to back. The
+  next session picks up where the last one stopped, so the music does not start
+  over at the first track.
+
+Click **Music Settings** on a channel to set:
+
+- **Music source**: the channel's audio list, or a folder (see
+  [Folder playlists](#folder-playlists)).
+- **Shuffle**: off plays the tracks in order, continuing from the last song
+  played; on picks them in random order.
+- **Repeat protection**: don't repeat a song within the last N tracks (default
+  10) or M minutes (default 60). 0 turns a limit off. With only a few tracks the
+  song played longest ago is used when every song is too recent, so music never
+  stops.
+
+Changes apply from the next song block or music session, so they never cut off
+the song that is playing. Starting, stopping or restarting a channel (including
+changing its mode or its filler settings) does stop the current song; that song
+is marked **cut** in the play history, does not count for repeat protection, and
+in order mode it plays again from the start.
+
+## Enabling, disabling and tagging tracks
+
+Audio tracks in the Media Library have two extra controls:
+
+- **Disable / Enable**: a disabled track stays in the library, its folder and any
+  audio lists, but is skipped by every channel (shown as **disabled**). Enable it
+  to put it back. The change applies from the next song block or music session.
+- **Lyrics** tag: **Vocals** (the song has lyrics) or **Instrumental**, or leave
+  it untagged. Use the **Lyrics** filter above the library to find tracks by tag.
+  Tags are only a label for sorting your library; they do not change rotation.
+
+## Play history
+
+**Recently Played** (above Channels) lists the last 100 songs played on any
+channel: when each started (in your browser's time zone), the channel, how long it
+played out of its length, and the result: **played to the end**, **cut** (with
+the reason, e.g. stream stopped or server restarted), or **playing**. **Play
+History** on a channel shows the same for that channel only. **Status & Log**
+also shows the song that is playing now.
+
+History older than 90 days is deleted when the server starts (`PLAY_HISTORY_DAYS` in
+`.env`). It is included in station backups.
+
+## Song lengths
+
+RezTV measures each track's length from the converted file when the upload is
+converted, so it knows exactly when a song ends. Tracks uploaded before this
+version have a length read from the original file's tags, which can be wrong for
+some MP3s; they show **length unverified** in the library. RezTV measures them
+once when the server starts. To measure again by hand, click **Re-measure audio
+durations** above the library; tick **Measure every audio track again** to check
+all tracks, not only the unverified ones. It runs in the background and reports
+how many lengths it corrected.

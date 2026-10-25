@@ -10,7 +10,9 @@ from collections import deque
 from pathlib import Path
 from typing import Callable
 
-from app.services.overlay import OverlayTicker, drawtext_filters
+from app.services.overlay import OverlayTicker, drawtext_filters, item_at
+from app.services.playtrack import PlayTracker
+from app.services.rotation import plan_block, track_seconds
 
 log = logging.getLogger("reztv.hls")
 
@@ -28,6 +30,9 @@ FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 STREAM_AUDIO_LOUDNORM = os.getenv("STREAM_AUDIO_LOUDNORM", "false").strip().lower() in {
     "1", "true", "yes", "on"}
 STREAM_LOUDNORM_TARGET = float(os.getenv("STATION_LOUDNORM_TARGET", "-16"))
+# Separate-audio channels play music in sessions of whole songs of about this length;
+# between sessions ffmpeg restarts on a song boundary and the HLS playlist continues.
+AUDIO_SESSION_MINUTES = max(1.0, float(os.getenv("AUDIO_SESSION_MINUTES", "60")))
 
 # playlist_id -> _Channel
 running_processes: dict[int, "_Channel"] = {}
@@ -119,11 +124,17 @@ def _video_out(overlay: tuple[Path, Path] | None) -> list[str]:
 def _build_separate_audio_cmd(video_concat: Path, audio_concat: Path,
                               stream_dir: Path, output_m3u8: Path,
                               duration: float | None = None,
-                              overlay: tuple[Path, Path] | None = None) -> list[str]:
-    """Separate-audio channel: two inputs, each its own endless loop, read in real
-    time. Picture comes from the video list (its sound is dropped), sound from the
-    audio list. The two lists switch items independently, so a song keeps playing
-    across video changes and vice versa."""
+                              overlay: tuple[Path, Path] | None = None,
+                              audio_loop: bool = False) -> list[str]:
+    """Separate-audio playback: two inputs read in real time. Picture comes from the
+    video list (looped; its sound is dropped), sound from the audio list. The lists
+    switch items independently, so a song keeps playing across video changes.
+
+    The audio list holds whole songs and is played once (audio_loop=False): with
+    -shortest, ffmpeg stops when the last song ends, so a block or session always
+    ends on a song boundary and no song is cut off. (-shortest_buf_duration keeps
+    ffmpeg from running ~10 s past the end of the music.) `duration` is only a
+    hard cap and is not used for normal playback."""
     # Plain resample, no async= padding: the concat input already gives continuous
     # timestamps, and async=1 was measured to insert ~0.1 s dropouts on loop.
     af = "aresample=44100"
@@ -133,12 +144,13 @@ def _build_separate_audio_cmd(video_concat: Path, audio_concat: Path,
         FFMPEG_BIN, "-hide_banner", "-loglevel", "warning",
         "-re", "-f", "concat", "-safe", "0", "-stream_loop", "-1",
         "-i", str(video_concat),
-        "-re", "-f", "concat", "-safe", "0", "-stream_loop", "-1",
+        "-re", "-f", "concat", "-safe", "0", *(["-stream_loop", "-1"] if audio_loop else []),
         "-i", str(audio_concat),
         "-map", "0:v:0", "-map", "1:a:0",
         *_video_out(overlay),
         "-af", af,
         *_AUDIO_OUT,
+        *([] if audio_loop else ["-shortest", "-shortest_buf_duration", "1"]),
         *(["-t", f"{duration:.0f}"] if duration else []),
         *_hls_out(stream_dir, output_m3u8),
     ]
@@ -160,10 +172,13 @@ def _normalize_source(src) -> dict:
                 # Optional per-file info ({"id", "title", "duration"}), same order as the lists.
                 "video_meta": list(src.get("video_meta") or []),
                 "audio_meta": list(src.get("audio_meta") or []),
-                "filler_meta": list(src.get("filler_meta") or [])}
+                "filler_meta": list(src.get("filler_meta") or []),
+                # Music rotation settings and recent plays (newest first), see rotation.py.
+                "rotation": dict(src.get("rotation") or {}),
+                "recent": list(src.get("recent") or [])}
     return {"mode": "standard", "video": list(src or []), "audio": [], "filler": [],
             "filler_seconds": DEFAULT_FILLER_SECONDS, "overlay": False,
-            "video_meta": [], "audio_meta": [], "filler_meta": []}
+            "video_meta": [], "audio_meta": [], "filler_meta": [], "rotation": {}, "recent": []}
 
 
 def _meta(src: dict, key: str, files: list[str]) -> list[dict]:
@@ -204,6 +219,20 @@ def next_mixed_slot(src: dict, phase: str | None, program_idx: int) -> tuple[str
     return "program", program_idx % max(len(src["video"]), 1)
 
 
+def plan_music(src: dict, target_seconds: float, now: float | None = None,
+               rng: random.Random | None = None) -> list[dict]:
+    """Whole songs for the next block/session: [{"id", "title", "duration", "path"}]."""
+    pool = []
+    for i, (path, meta) in enumerate(zip(src["audio"], _meta(src, "audio", src["audio"]))):
+        pool.append({**meta, "id": meta.get("id", f"#{i}"), "path": path})
+    rot = src.get("rotation") or {}
+    return plan_block(pool, src.get("recent") or [], target_seconds,
+                      shuffle=bool(rot.get("shuffle")),
+                      gap_tracks=int(rot.get("gap_tracks", 10) or 0),
+                      gap_minutes=int(rot.get("gap_minutes", 60) or 0),
+                      now=time.time() if now is None else now, rng=rng)
+
+
 def _write_concat(path: Path, files: list[str]):
     with open(path, "w") as f:
         for media in files:
@@ -211,10 +240,41 @@ def _write_concat(path: Path, files: list[str]):
             f.write(f"file '{safe_path}'\n")
 
 
+class _HistoryTee:
+    """Passes play events to the real recorder (database) and keeps the last few
+    plays in memory, so rotation works even when no recorder is configured."""
+
+    def __init__(self, recorder, keep: int = 200):
+        self.recorder = recorder
+        self.recent: deque = deque(maxlen=keep)   # newest first
+
+    def started(self, playlist_id, song, mode, started_at):
+        row = {"media_id": song.get("id"), "started_at": started_at, "outcome": "playing"}
+        self.recent.appendleft(row)
+        token = None
+        if self.recorder:
+            try:
+                token = self.recorder.started(playlist_id, song, mode, started_at)
+            except Exception:
+                log.exception("Could not record play start")
+        return (row, token)
+
+    def finished(self, token, outcome, played_seconds, reason, ended_at):
+        row, inner = token
+        row["outcome"] = outcome
+        if self.recorder and inner is not None:
+            self.recorder.finished(inner, outcome, played_seconds, reason, ended_at)
+
+
 class _Channel:
-    def __init__(self, playlist_id: int, get_files: Callable[[], list[str]]):
+    def __init__(self, playlist_id: int, get_files: Callable[[], list[str]], recorder=None):
         self.playlist_id = playlist_id
         self.get_files = get_files
+        self.history = _HistoryTee(recorder)   # play history (see playtrack.py)
+        self.tracker: PlayTracker | None = None
+        self.songs: list[dict] = []    # music planned for the current ffmpeg run
+        self.video_next = 0            # separate-audio: clip to start the next session on
+        self._video_plan: tuple[int, list[dict]] | None = None
         self.stop_event = threading.Event()
         self.process: subprocess.Popen | None = None
         self.restarts = 0
@@ -243,27 +303,50 @@ class _Channel:
                 random.shuffle(order)
                 clips = [src["filler"][i] for i in order]
                 clip_meta = [_meta(src, "filler", src["filler"])[i] for i in order]
-                music = list(src["audio"])
-                music_meta = _meta(src, "audio", music)
-                k = self.block % len(music)   # start each block on the next song
+                # Whole songs adding up to about the block length; the block ends
+                # when the last song ends (never in the middle of a song).
+                self.songs = plan_music(src, src["filler_seconds"])
                 _write_concat(video_concat, clips)
                 audio_concat = stream_dir / "audio.txt"
-                _write_concat(audio_concat, music[k:] + music[:k])
+                _write_concat(audio_concat, [t["path"] for t in self.songs])
                 return _build_separate_audio_cmd(
-                    video_concat, audio_concat, stream_dir, out, duration=src["filler_seconds"],
-                    overlay=self._overlay(src, stream_dir, clip_meta,
-                                          music_meta[k:] + music_meta[:k]))
+                    video_concat, audio_concat, stream_dir, out,
+                    overlay=self._overlay(src, stream_dir, clip_meta, self.songs))
             _write_concat(video_concat, [src["video"][self.program_idx]])
             return _build_cmd(video_concat, stream_dir, out, loop=False)
-        _write_concat(video_concat, src["video"])
         if src["mode"] == "separate_audio":
+            # A session of whole songs (about AUDIO_SESSION_MINUTES); the video list
+            # carries on from the clip after the one on screen when the last session ended.
+            self.songs = plan_music(src, AUDIO_SESSION_MINUTES * 60)
+            n = len(src["video"])
+            k = self.video_next % n
+            videos = src["video"][k:] + src["video"][:k]
+            vmeta = _meta(src, "video", src["video"])
+            vmeta = vmeta[k:] + vmeta[:k]
+            self._video_plan = (k, vmeta)
+            _write_concat(video_concat, videos)
             audio_concat = stream_dir / "audio.txt"
-            _write_concat(audio_concat, src["audio"])
+            _write_concat(audio_concat, [t["path"] for t in self.songs])
             return _build_separate_audio_cmd(
                 video_concat, audio_concat, stream_dir, out,
-                overlay=self._overlay(src, stream_dir, _meta(src, "video", src["video"]),
-                                      _meta(src, "audio", src["audio"])))
+                overlay=self._overlay(src, stream_dir, vmeta, self.songs))
+        _write_concat(video_concat, src["video"])
         return _build_cmd(video_concat, stream_dir, out)
+
+    def _music_run(self, src: dict) -> bool:
+        return src["mode"] == "separate_audio" or (
+            src["mode"] == "mixed" and self.phase == "filler")
+
+    def _end_run(self, src: dict, completed: bool, reason: str | None, elapsed: float):
+        """Close the play history for this ffmpeg run and remember where the video was."""
+        if self.tracker:
+            self.tracker.finish(completed, reason)
+            self.tracker = None
+        if src["mode"] == "separate_audio" and self._video_plan:
+            k, vmeta = self._video_plan
+            on_screen = item_at([m.get("duration") for m in vmeta], elapsed)
+            self.video_next = k + on_screen + 1
+            self._video_plan = None
 
     def _overlay(self, src: dict, stream_dir: Path, clips: list[dict],
                  songs: list[dict]) -> tuple[Path, Path] | None:
@@ -292,13 +375,17 @@ class _Channel:
 
     def _spawn(self, src: dict):
         self._stop_overlay()
+        self.songs = []
         cmd = self._prepare(src)
-        extra = (f", {len(src['audio'])} audio tracks"
+        planned = sum(track_seconds(t) for t in self.songs) / 60
+        extra = (f", session of {len(self.songs)} songs ({planned:.1f} min)"
+                 f" from {len(src['audio'])} audio tracks"
                  if src["mode"] == "separate_audio" else "")
         if src["mode"] == "mixed":
             extra = (f", now {self.phase} block #{self.block}"
-                     f" ({len(src['filler'])} filler clips, {len(src['audio'])} tracks,"
-                     f" {src['filler_seconds'] / 60:g} min)" if self.phase == "filler"
+                     f" ({len(src['filler'])} filler clips, {len(self.songs)} of"
+                     f" {len(src['audio'])} tracks = {planned:.1f} min,"
+                     f" target {src['filler_seconds'] / 60:g} min)" if self.phase == "filler"
                      else f", now program {self.program_idx + 1} of {len(src['video'])}")
         self.logger.write(f"=== {time.strftime('%Y-%m-%d %H:%M:%S')} starting ffmpeg "
                           f"(mode {src['mode']}: {len(src['video'])} videos{extra}, "
@@ -312,6 +399,9 @@ class _Channel:
         proc = self.process
         if self.overlay:
             self.overlay.start()
+        if self.songs:
+            self.tracker = PlayTracker(self.playlist_id, src["mode"], self.songs, self.history)
+            self.tracker.start()
         threading.Thread(target=self._pump, args=(proc,), daemon=True).start()
 
     def _pump(self, proc: subprocess.Popen):
@@ -342,6 +432,9 @@ class _Channel:
             except Exception:
                 log.exception("Channel %s: could not load playlist", self.playlist_id)
                 files = _normalize_source([])
+            if not files["recent"]:
+                # No stored history (no database recorder): use this run's own plays.
+                files["recent"] = list(self.history.recent)
             problem = _source_problem(files)
             if problem:
                 self.logger.write(f"{problem}; waiting before retry")
@@ -365,10 +458,23 @@ class _Channel:
                 log.error("Channel %s: could not start ffmpeg: %s", self.playlist_id, e)
             else:
                 while self.process.poll() is None and not self.stop_event.is_set():
+                    if self.tracker:
+                        self.tracker.tick()
                     self.stop_event.wait(1)
                 if self.stop_event.is_set():
+                    self._kill()
+                    self._end_run(files, False, "channel stopped or restarted",
+                                  time.monotonic() - started)
                     break
                 self.last_exit = self.process.returncode
+                self._end_run(files, self.last_exit == 0 and self._music_run(files),
+                              f"ffmpeg exited with code {self.last_exit}",
+                              time.monotonic() - started)
+                if files["mode"] == "separate_audio" and self.last_exit == 0:
+                    # Music session ended on a song boundary: start the next one now.
+                    self.logger.write("Music session finished; starting the next one")
+                    backoff = BACKOFF_START
+                    continue
                 if files["mode"] == "mixed" and self.last_exit == 0:
                     # Slot finished normally: go straight to the next one.
                     if self.phase == "filler":
@@ -401,14 +507,16 @@ class _Channel:
         self.thread.join(timeout=15)
 
 
-def start_playlist_stream(playlist_id: int, get_files: Callable[[], list[str]]) -> str:
+def start_playlist_stream(playlist_id: int, get_files: Callable[[], list[str]],
+                          recorder=None) -> str:
     """Start (or restart) a supervised stream. get_files is called on every
-    (re)start so playlist edits are picked up after a crash."""
+    (re)start so playlist edits are picked up after a crash. recorder (optional)
+    writes the play history."""
     problem = _source_problem(_normalize_source(get_files()))
     if problem:
         raise ValueError(problem)
     stop_playlist_stream(playlist_id)
-    ch = _Channel(playlist_id, get_files)
+    ch = _Channel(playlist_id, get_files, recorder)
     with _lock:
         running_processes[playlist_id] = ch
     ch.start()
@@ -427,8 +535,10 @@ def stream_status(playlist_id: int) -> dict:
     if not ch:
         return {"running": False}
     alive = ch.process is not None and ch.process.poll() is None
+    tr = ch.tracker
+    now_playing = (tr.songs[tr.idx].get("title") if tr and 0 <= tr.idx < len(tr.songs) else None)
     return {"running": True, "ffmpeg_alive": alive, "restarts": ch.restarts,
-            "last_exit_code": ch.last_exit, "slot": ch.phase}
+            "last_exit_code": ch.last_exit, "slot": ch.phase, "now_playing": now_playing}
 
 
 def read_log_tail(playlist_id: int, lines: int = 100) -> list[str]:

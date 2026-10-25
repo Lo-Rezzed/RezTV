@@ -32,6 +32,8 @@ services:
       STATION_LOUDNORM_TARGET: ${STATION_LOUDNORM_TARGET:--16}
       GIF_MIN_SECONDS: ${GIF_MIN_SECONDS:-30}
       KEEP_ORIGINALS: ${KEEP_ORIGINALS:-false}
+      AUDIO_SESSION_MINUTES: ${AUDIO_SESSION_MINUTES:-60}
+      PLAY_HISTORY_DAYS: ${PLAY_HISTORY_DAYS:-90}
       BACKUP_PATH: /app/backups
     volumes:
       - ./media:/app/media

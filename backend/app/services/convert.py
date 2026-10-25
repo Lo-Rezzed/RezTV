@@ -76,6 +76,42 @@ def probe(path: str, kind: str = "video") -> dict:
             "duration": float(m.group(1)) if m else None}
 
 
+def measure_duration(path: str, kind: str = "audio") -> float | None:
+    """Exact playing time of a station file, measured from its packets (first
+    timestamp to the end of the last packet) instead of trusting header metadata,
+    which can be wrong (VBR MP3s, odd tags). Falls back to the container duration.
+    Song scheduling depends on this number, so it is always taken from the
+    converted file, never from the upload."""
+    stream = "a:0" if kind == "audio" else "v:0"
+    try:
+        r = subprocess.run([FFPROBE_BIN, "-v", "error", "-select_streams", stream,
+                            "-show_entries", "packet=pts_time,duration_time",
+                            "-of", "csv=p=0", path],
+                           capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired):
+        r = None
+    first = end = None
+    if r is not None and r.returncode == 0:
+        for line in r.stdout.splitlines():
+            parts = line.strip().split(",")
+            try:
+                pts = float(parts[0])
+            except (ValueError, IndexError):
+                continue
+            try:
+                dur = float(parts[1])
+            except (ValueError, IndexError):
+                dur = 0.0
+            first = pts if first is None else min(first, pts)
+            end = pts + dur if end is None else max(end, pts + dur)
+    if first is not None and end is not None and end > first:
+        return round(end - first, 3)
+    try:
+        return probe(path, kind)["duration"]
+    except ValueError:
+        return None
+
+
 def _exact_rate(v) -> Fraction | None:
     """ffprobe rate string ("30/1", "30000/1001", "15360/512") as an exact fraction."""
     try:
@@ -337,6 +373,8 @@ class Converter:
             if r.returncode != 0:
                 raise ValueError((r.stderr or "ffmpeg failed").strip()[-500:])
             out = probe(tmp, kind)
+            if kind == "audio":
+                out["duration"] = measure_duration(tmp, "audio") or out["duration"]
             os.replace(tmp, dst)
         except (ValueError, OSError, subprocess.TimeoutExpired) as e:
             if os.path.exists(tmp):
@@ -351,6 +389,7 @@ class Converter:
             except OSError as e:
                 log.warning("Could not remove original %s: %s", src, e)
         if self._set(mid, status="ready", error=None, duration=out["duration"],
+                     duration_source="measured" if out["duration"] else None,
                      original_path=src if keep else None) is None:
             # Deleted while converting: clean up the result too.
             for p in (dst, src):
