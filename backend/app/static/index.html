@@ -38,6 +38,18 @@
     .summary-table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.85rem; }
     .summary-table td, .summary-table th { text-align: left; padding: 5px 6px; border-bottom: 1px solid #eee; vertical-align: top; }
     .spec-warn { color: #b26a00; }
+    .tag { font-size: 0.8rem; border-radius: 4px; padding: 1px 6px; background: #eee; color: #555; }
+    .tag.off { background: #ffe0e0; color: #a00; }
+    .tag.vox { background: #fff1d6; color: #8a5a00; }
+    .tag.inst { background: #e2f3ea; color: #23704a; }
+    li.track-off > span:first-child { opacity: 0.55; }
+    .history-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 8px; }
+    .history-table td, .history-table th { text-align: left; padding: 4px 6px; border-bottom: 1px solid #eee; vertical-align: top; }
+    .outcome-natural { color: #23704a; } .outcome-cut { color: #c00; } .outcome-playing { color: #06c; }
+    .music-panel { background: #fff; border: 1px solid #e3e3e3; border-radius: 8px; padding: 8px 12px; margin-top: 8px; }
+    dialog { border: 1px solid #ccc; border-radius: 10px; padding: 18px 20px; min-width: 340px; }
+    dialog label { display: block; margin: 8px 0; }
+    dialog menu { display: flex; justify-content: flex-end; gap: 6px; padding: 0; margin: 14px 0 0; }
   </style>
 </head>
 <body>
@@ -82,7 +94,7 @@
       <option value="mixed">Mixed: programs (own sound) alternating with filler blocks (shuffled clips + music)</option>
     </select>
     <span id="mixedOptions" style="display:none;">
-      <input type="text" id="fillerFolder" placeholder="Filler clips folder" title="Media folder whose videos are shuffled for filler blocks">
+      <label>Filler clips folder <select id="fillerFolder" title="Media folder whose videos are shuffled for filler blocks"></select></label>
       <input type="number" id="fillerMinutes" value="30" min="1" max="720" style="width:5em;" title="Filler block length in minutes"> min
     </span>
     <button onclick="createPlaylist()">Create Channel</button>
@@ -96,9 +108,15 @@
       <button onclick="loadMedia()">Refresh Media</button>
       <input type="search" id="mediaSearch" placeholder="Search file names..." title="Searches the folder picked on the left, or all media">
       <label>Sort <select id="mediaSort">
-        <option value="newest">Newest first</option><option value="oldest">Oldest first</option></select></label>
+        <option value="newest">Newest first</option><option value="oldest">Oldest first</option><option value="title">Title A&ndash;Z</option></select></label>
+      <label>Type <select id="mediaKind" title="Show only videos or only audio tracks">
+        <option value="">All</option><option value="video">Video</option><option value="audio">Audio</option></select></label>
+      <label>Lyrics <select id="mediaVocals" title="Audio tracks tagged as having vocals (lyrics) or instrumental">
+        <option value="">Any</option><option value="vocals">With vocals</option><option value="instrumental">Instrumental</option><option value="untagged">Not tagged</option></select></label>
       <label>Show <select id="mediaPageSize">
         <option>25</option><option>50</option><option>100</option></select> per page</label>
+      <button onclick="remeasureDurations()" id="remeasureBtn" title="Measure audio track lengths from the converted files (fixes lengths read from upload metadata)">Re-measure audio durations</button>
+      <span id="remeasureStatus" style="color:#555; font-size:0.9rem;"></span>
     </div>
     <div class="library">
       <div class="folder-sidebar">
@@ -136,12 +154,27 @@
       <tbody id="backupList"></tbody></table>
   </section>
 
+  <!-- Play history -->
+  <section>
+    <h2>Recently Played</h2>
+    <p style="color:#555; margin-top:0;">The last 100 songs played on any channel. <em>Cut</em> means the song was stopped before its end
+      (stream stopped or restarted, or ffmpeg failed); cut songs play again from the start and do not count for repeat protection.</p>
+    <button onclick="loadHistory()">Refresh</button>
+    <div id="historyList"></div>
+  </section>
+
   <!-- Channels -->
   <section>
     <h2>Channels</h2>
     <button onclick="loadPlaylists()">Refresh Channels</button>
     <div id="playlistList"></div>
   </section>
+
+  <dialog id="askDialog"><form method="dialog">
+    <h3 id="askTitle" style="margin-top:0;"></h3>
+    <div id="askBody"></div>
+    <menu><button value="cancel" formnovalidate>Cancel</button><button value="ok" id="askOk">OK</button></menu>
+  </form></dialog>
 
   <script>
     const API = "";
@@ -430,7 +463,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(Object.assign({ name, mode: document.getElementById("playlistMode").value },
           document.getElementById("playlistMode").value === "mixed" ? {
-            filler_folder: document.getElementById("fillerFolder").value.trim() || null,
+            filler_folder: document.getElementById("fillerFolder").value || null,
             filler_minutes: parseInt(document.getElementById("fillerMinutes").value, 10) || 30
           } : {}))
       });
@@ -446,12 +479,24 @@
     const libSort = document.getElementById("mediaSort");
     const libPageSize = document.getElementById("mediaPageSize");
     const libSearch = document.getElementById("mediaSearch");
+    const libKind = document.getElementById("mediaKind");
+    const libVocals = document.getElementById("mediaVocals");
     libSort.value = localStorage.getItem("reztvMediaSort") || "newest";
+    libKind.value = localStorage.getItem("reztvMediaKind") || "";
+    libVocals.value = localStorage.getItem("reztvMediaVocals") || "";
+    // Type and lyrics filters apply to the folder pages and to search results.
+    function addFilters(params) {
+      if (libKind.value) params.set("kind", libKind.value);
+      if (libVocals.value) { params.set("vocals", libVocals.value); params.set("kind", "audio"); }
+      return params;
+    }
     libPageSize.value = localStorage.getItem("reztvMediaPageSize") || "25";
     const pageSize = () => parseInt(libPageSize.value, 10) || 25;
     let searchPage = 1;
     const resetPages = () => { Object.keys(folderPages).forEach(k => delete folderPages[k]); searchPage = 1; };
     libSort.addEventListener("change", () => { localStorage.setItem("reztvMediaSort", libSort.value); resetPages(); loadMedia(); });
+    libKind.addEventListener("change", () => { localStorage.setItem("reztvMediaKind", libKind.value); resetPages(); loadMedia(); });
+    libVocals.addEventListener("change", () => { localStorage.setItem("reztvMediaVocals", libVocals.value); resetPages(); loadMedia(); });
     libPageSize.addEventListener("change", () => { localStorage.setItem("reztvMediaPageSize", libPageSize.value); resetPages(); loadMedia(); });
     let searchTimer;
     libSearch.addEventListener("input", () => {
@@ -487,6 +532,9 @@
         folders.map(f => `<li class="${currentFolder === f.name ? "active" : ""}" data-folder="${esc(f.name)}">${esc(f.name)} (${f.count})</li>`).join("");
       folderList.querySelectorAll("li").forEach(li => li.onclick = () => selectFolder(li.dataset.folder));
       fillFolderPicker(folders, pickFolder);
+      const ff = document.getElementById("fillerFolder"), ffWas = ff.value;
+      ff.innerHTML = `<option value="">(none yet)</option>` + folderOptionsHtml(ffWas);
+      ff.value = ffWas;
 
       // "Add whole folder to channel" bar
       const folderBar = document.getElementById("folderBar");
@@ -520,7 +568,7 @@
       const gen = ++searchGen;
       if (page) searchPage = page;
       const q = libSearch.value.trim();
-      const params = new URLSearchParams({ q, page: searchPage, page_size: pageSize(), sort: libSort.value });
+      const params = addFilters(new URLSearchParams({ q, page: searchPage, page_size: pageSize(), sort: libSort.value }));
       if (currentFolder) params.set("folder", currentFolder);
       const res = await fetch(`${API}/media?${params}`);
       const d = await readJson(res);
@@ -562,13 +610,14 @@
     async function loadFolderPage(det, page) {
       const folder = det.dataset.folder;
       if (page) folderPages[folder] = page;
-      const params = new URLSearchParams({ folder, page: folderPages[folder] || 1, page_size: pageSize(), sort: libSort.value });
+      const params = addFilters(new URLSearchParams({ folder, page: folderPages[folder] || 1, page_size: pageSize(), sort: libSort.value }));
       const res = await fetch(`${API}/media?${params}`);
       const d = await readJson(res);
       if (!res.ok) { det.querySelector(".folder-items").innerHTML = `<li class="error">${esc(errText(res, d, "Could not load"))}</li>`; return; }
       folderPages[folder] = d.page;
       det.querySelector(".folder-items").innerHTML = d.items.length
-        ? d.items.map(m => renderMediaItem(m, libraryPlaylists)).join("") : "<li>Empty folder</li>";
+        ? d.items.map(m => renderMediaItem(m, libraryPlaylists)).join("")
+        : `<li>${libKind.value || libVocals.value ? "Nothing here matches the Type / Lyrics filter" : "Empty folder"}</li>`;
       const pager = det.querySelector(".pager");
       pager.innerHTML = d.pages > 1 ? pagerHtml(d) : "";
       pager.querySelectorAll("button").forEach(b => b.onclick = () => loadFolderPage(det, parseInt(b.dataset.go, 10)));
@@ -583,13 +632,21 @@
       // Videos can go on any channel; audio tracks only into a separate-audio channel's music list.
       const targets = isAudio ? playlists.filter(p => HAS_AUDIO_LIST(p.mode)) : playlists;
       const options = targets.map(p => `<option value="${p.id}">${esc(p.name)}${isAudio ? " (audio playlist)" : ""}</option>`).join("");
+      const off = isAudio && m.enabled === false;
       const kindTag = (isAudio ? `<span style="color:#06c; font-size:0.85rem;">&#9835; audio</span>` : "") +
+        (off ? ` <span class="tag off" title="Disabled: skipped in rotation">disabled</span>` : "") +
+        (isAudio && m.vocals ? ` ${vocalsTag(m.vocals)}` : "") +
+        (isAudio && ready && m.duration_measured === false ? ` <span class="tag" title="Length read from the upload's metadata; Re-measure audio durations checks it">length unverified</span>` : "") +
         (showFolder ? ` <span style="color:#888; font-size:0.85rem;">in ${esc(m.folder)}</span>` : "");
       return `
-        <li>
+        <li class="${off ? "track-off" : ""}">
           <span>ID ${m.id}: ${esc(m.original_filename || m.filename)} ${kindTag} ${badge} <span style="color:#888; font-size:0.85rem;">${ready ? fmt(m.duration) : ""}</span>${m.status === "failed" && m.error ? `<br><small style="color:#c00;">${esc(m.error)}</small>` : ""}</span>
           <div>
             <button onclick="moveMedia(${m.id}, '${esc(m.folder)}')">Move</button>
+            ${isAudio ? `<select title="Lyrics tag" onchange="setVocals(${m.id}, this.value)">
+                ${[["", "Lyrics?"], ["vocals", "Vocals"], ["instrumental", "Instrumental"]].map(([v, l]) =>
+                  `<option value="${v}" ${(m.vocals || "") === v ? "selected" : ""}>${l}</option>`).join("")}</select>
+              <button onclick="setEnabled(${m.id}, ${off})" title="${off ? "Put this track back in rotation" : "Skip this track in rotation without deleting it"}">${off ? "Enable" : "Disable"}</button>` : ""}
             ${m.status === "failed" ? `<button onclick="retryConvert(${m.id})">Retry</button>` : ""}
             <select id="select-${m.id}" ${ready ? "" : "disabled"}>
               <option value="">${isAudio && !targets.length ? "No separate-audio channels" : "Select channel..."}</option>
@@ -635,14 +692,59 @@
       loadMedia();
     }
 
+    // ---- Dialog with a folder dropdown (the existing folders plus "New folder...")
+    function folderOptionsHtml(current) {
+      const names = [...knownFolders];
+      if (current && !names.includes(current)) names.push(current);
+      return names.map(n => `<option value="${esc(n)}" ${n === current ? "selected" : ""}>${esc(n)}</option>`).join("");
+    }
+    function folderSelectHtml(name, current, noneLabel) {
+      return `<select name="${name}" data-folder-select>
+          ${noneLabel ? `<option value="" ${current ? "" : "selected"}>${esc(noneLabel)}</option>` : ""}
+          ${folderOptionsHtml(current)}<option value="${NEW_FOLDER}">New folder...</option></select>
+        <input type="text" name="${name}_new" placeholder="New folder name" maxlength="64" style="display:none;">`;
+    }
+    async function refreshFolders() {
+      const res = await fetch(`${API}/media/folders`);
+      if (res.ok) knownFolders = (await res.json()).map(f => f.name);
+    }
+    // Opens the dialog; resolves to the form when OK is pressed, otherwise null.
+    function askDialog(title, bodyHtml) {
+      const dlg = document.getElementById("askDialog");
+      document.getElementById("askTitle").textContent = title;
+      const body = document.getElementById("askBody");
+      body.innerHTML = bodyHtml;
+      body.querySelectorAll("[data-folder-select]").forEach(sel => {
+        const input = sel.nextElementSibling;
+        sel.onchange = () => { input.style.display = sel.value === NEW_FOLDER ? "" : "none"; if (sel.value === NEW_FOLDER) input.focus(); };
+      });
+      return new Promise(resolve => {
+        dlg.onclose = () => resolve(dlg.returnValue === "ok" ? dlg.querySelector("form") : null);
+        dlg.returnValue = "";
+        dlg.showModal();
+      });
+    }
+    // The folder picked in a dialog field: a name, "" for none, or null if a new name is invalid.
+    function dialogFolder(form, name) {
+      const v = form.elements[name].value;
+      if (v !== NEW_FOLDER) return v;
+      const typed = form.elements[name + "_new"].value.trim().replace(/\s+/g, " ");
+      if (!FOLDER_RE.test(typed)) { alert("Folder names can use letters, numbers, spaces, - and _ (up to 64 characters)."); return null; }
+      return typed;
+    }
+
     async function moveMedia(mediaId, current) {
-      const folder = prompt("Move to folder (type a new name to create one):", current);
-      if (folder === null || folder.trim() === "" || folder.trim() === current) return;
+      await refreshFolders();
+      const form = await askDialog(`Move media ID ${mediaId}`,
+        `<label>Move to folder ${folderSelectHtml("folder", current)}</label>`);
+      if (!form) return;
+      const folder = dialogFolder(form, "folder");
+      if (!folder || folder === current) return;
 
       const res = await fetch(`${API}/media/${mediaId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ folder: folder.trim() })
+        body: JSON.stringify({ folder })
       });
 
       if (res.ok) {
@@ -651,6 +753,54 @@
       } else {
         alert("Failed to move media");
       }
+    }
+
+    async function updateMedia(mediaId, fields) {
+      const res = await fetch(`${API}/media/${mediaId}`, {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(fields)
+      });
+      if (!res.ok) alert("Could not save: " + errText(res, await readJson(res), "error"));
+      return res.ok;
+    }
+    async function setEnabled(mediaId, on) {
+      if (await updateMedia(mediaId, { enabled: on })) { loadMedia(); loadPlaylists(); }
+    }
+    async function setVocals(mediaId, v) {
+      if (await updateMedia(mediaId, { vocals: v })) loadMedia();
+    }
+    function vocalsTag(v) {
+      return v === "vocals" ? `<span class="tag vox" title="Has vocals / lyrics">vocals</span>`
+        : v === "instrumental" ? `<span class="tag inst">instrumental</span>` : "";
+    }
+
+    // ---- Durations
+    async function remeasureStatus() {
+      const res = await fetch(`${API}/media/remeasure-durations`);
+      return res.ok ? res.json() : null;
+    }
+    async function remeasureDurations() {
+      const st = await remeasureStatus();
+      const form = await askDialog("Re-measure audio durations",
+        `<p style="margin:0;">Measures each track's length from its converted file, so song blocks are planned with the real length.
+          ${st ? `${st.unmeasured} track${st.unmeasured === 1 ? " has" : "s have"} a length read from upload metadata.` : ""}</p>
+         <label><input type="checkbox" name="all"> Measure every audio track again (not only those)</label>`);
+      if (!form) return;
+      const status = document.getElementById("remeasureStatus");
+      const btn = document.getElementById("remeasureBtn");
+      const res = await fetch(`${API}/media/remeasure-durations`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ all: form.elements.all.checked })
+      });
+      if (!res.ok) { status.textContent = errText(res, await readJson(res), "Could not start"); return; }
+      btn.disabled = true;
+      status.textContent = "Measuring...";
+      let d;
+      do { await new Promise(r => setTimeout(r, 1500)); d = await remeasureStatus(); } while (d && d.running);
+      btn.disabled = false;
+      const r = d && d.result;
+      status.textContent = !r ? "" : r.error ? `Failed: ${r.error}`
+        : `Checked ${r.checked}, corrected ${r.changed}` + (r.missing ? `, ${r.missing} file(s) missing` : "") + (r.failed ? `, ${r.failed} could not be read` : "") + ".";
+      loadMedia(); loadPlaylists();
     }
 
     async function addFolderToPlaylist() {
@@ -712,15 +862,30 @@
         ]);
         if (gen !== loadPlaylistsGen) return;
         const fmt = s => s ? ` <small style="color:#888;">${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}</small>` : "";
+        const musicLine = !separate ? "" : `
+          <div style="margin-top:10px; color:#555;">&#9835; Music:
+            ${p.audio_folder ? `every track in folder <strong>${esc(p.audio_folder)}</strong> (new uploads join automatically)` : "this channel's audio list below"}
+            &middot; ${p.audio_shuffle ? "shuffled" : "in order"}
+            &middot; ${p.repeat_gap_tracks || p.repeat_gap_minutes
+              ? `no repeats within ${p.repeat_gap_tracks} tracks${p.repeat_gap_minutes ? ` or ${p.repeat_gap_minutes} min` : ""}` : "repeat protection off"}
+            <div>
+              <button onclick="editMusic(${p.id})">Music Settings</button>
+              <button onclick="toggleMusic(${p.id})">Tracks in Rotation</button>
+              <button onclick="toggleHistory(${p.id})">Play History</button>
+            </div>
+            <div id="music-panel-${p.id}" class="music-panel" style="display:none;"></div>
+            <div id="history-panel-${p.id}" class="music-panel" style="display:none;"></div>
+          </div>`;
         const audioListHtml = !separate ? "" : `
           <div style="margin-top:10px;"><strong>&#9835; Audio playlist</strong>
-            <small style="color:#888;">${mixed ? "plays under the filler blocks" : "plays continuously over the videos; video sound is muted"}</small></div>
+            <small style="color:#888;">${p.audio_folder ? `not used while the channel plays folder ${esc(p.audio_folder)}`
+              : mixed ? "plays under the filler blocks" : "plays over the videos; video sound is muted"}</small></div>
           ${audioItems.length === 0
             ? `<p style="color:#888; margin:10px 0;">No audio tracks yet. Upload music, then add it from the Media Library.</p>`
             : `<ul class="sortable" data-playlist-id="${p.id}" data-list="audio" style="list-style:none; padding:0; margin:12px 0;">
               ${audioItems.map(m => `
                 <li draggable="true" data-id="${m.id}" style="padding:10px; margin:6px 0; background:#e8f0fb; border-radius:6px; cursor:grab; display:flex; justify-content:space-between; align-items:center;">
-                  <span>&#9835; ${m.title || m.original_filename}${fmt(m.duration)}${m.status && m.status !== "ready" ? ` <small style="color:#c00;">(${m.status}, skipped)</small>` : ""}</span>
+                  <span>&#9835; ${esc(m.title || m.original_filename)}${fmt(m.duration)}${m.status && m.status !== "ready" ? ` <small style="color:#c00;">(${m.status}, skipped)</small>` : ""}${m.enabled === false ? ` <span class="tag off">disabled, skipped</span>` : ""}${m.vocals ? " " + vocalsTag(m.vocals) : ""}</span>
                   <span style="color:#888; font-size:0.85rem;">
                     ID ${m.id}
                     <button onclick="removeAudioFromPlaylist(${p.id}, ${m.id})" title="Remove from this channel's audio playlist (stays in the library)">Remove</button>
@@ -760,6 +925,7 @@
           ${mixed ? `<div style="margin-top:10px; color:#555;">Plays: program &rarr; ${p.filler_minutes} min filler block &rarr; next program...
             Filler clips: folder <strong id="filler-folder-${p.id}">${p.filler_folder || "(none set)"}</strong></div>` : ""}
           ${separate ? `<div style="margin-top:10px;"><strong>${mixed ? "Programs (each plays with its own sound)" : "Video playlist"}</strong></div>` : ""}
+          ${musicLine}
           ${mediaListHtml}
           ${audioListHtml}
           <div style="margin-top: 12px;">
@@ -782,17 +948,20 @@
 
     // ========== Mixed mode filler settings ==========
     async function editFiller(id) {
-      const p = (await fetch(`${API}/playlists/${id}`).then(r => r.json()));
-      const folder = prompt("Filler clips folder (videos in this media folder are shuffled during filler blocks):", p.filler_folder || "");
+      const [p] = await Promise.all([fetch(`${API}/playlists/${id}`).then(r => r.json()), refreshFolders()]);
+      const form = await askDialog("Filler settings",
+        `<label>Filler clips folder (its videos are shuffled during filler blocks)<br>${folderSelectHtml("folder", p.filler_folder || "", "(none)")}</label>
+         <label>Block length <input type="number" name="minutes" min="1" max="720" value="${p.filler_minutes || 30}" style="width:5em;"> minutes</label>
+         <small style="color:#666;">A block is whole songs adding up to about this length; it ends when its last song ends, so it can run a little long.</small>`);
+      if (!form) return;
+      const folder = dialogFolder(form, "folder");
       if (folder === null) return;
-      const mins = prompt("Filler block length in minutes:", p.filler_minutes || 30);
-      if (mins === null) return;
       const res = await fetch(`${API}/playlists/${id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filler_folder: folder, filler_minutes: parseInt(mins, 10) || 30 })
+        body: JSON.stringify({ filler_folder: folder, filler_minutes: parseInt(form.elements.minutes.value, 10) || 30 })
       });
-      if (!res.ok) alert("Failed to save filler settings");
+      if (!res.ok) alert("Failed to save filler settings: " + errText(res, await readJson(res), "error"));
       loadPlaylists();
     }
 
@@ -804,6 +973,74 @@
       });
       if (!res.ok) alert("Failed to change the on-screen info setting");
       loadPlaylists();
+    }
+
+    // ========== Music: source, shuffle, repeat protection, history ==========
+    async function editMusic(id) {
+      const [p] = await Promise.all([fetch(`${API}/playlists/${id}`).then(r => r.json()), refreshFolders()]);
+      const form = await askDialog(`Music settings: ${p.name}`,
+        `<label>Music source<br><select name="folder">
+            <option value="" ${p.audio_folder ? "" : "selected"}>This channel's audio list</option>
+            ${folderOptionsHtml(p.audio_folder || "")}</select>
+          <br><small style="color:#666;">Pick a folder to play every audio track in it; tracks uploaded there later join automatically.</small></label>
+         <label><input type="checkbox" name="shuffle" ${p.audio_shuffle ? "checked" : ""}> Shuffle</label>
+         <label>Don't repeat a song within the last <input type="number" name="tracks" min="0" max="1000" value="${p.repeat_gap_tracks}" style="width:4.5em;"> tracks</label>
+         <label>&hellip;or within <input type="number" name="minutes" min="0" max="10080" value="${p.repeat_gap_minutes}" style="width:5.5em;"> minutes</label>
+         <small style="color:#666;">0 turns a limit off. With few tracks the oldest-played song is used when every song is too recent.
+           Changes apply from the next song block (nothing is cut off).</small>`);
+      if (!form) return;
+      const res = await fetch(`${API}/playlists/${id}`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ audio_folder: form.elements.folder.value, audio_shuffle: form.elements.shuffle.checked,
+          repeat_gap_tracks: parseInt(form.elements.tracks.value, 10) || 0,
+          repeat_gap_minutes: parseInt(form.elements.minutes.value, 10) || 0 })
+      });
+      if (!res.ok) alert("Failed to save music settings: " + errText(res, await readJson(res), "error"));
+      loadPlaylists();
+    }
+
+    const fmtLen = s => s == null ? "" : `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
+
+    async function toggleMusic(id) {
+      const panel = document.getElementById(`music-panel-${id}`);
+      if (panel.style.display === "block") { panel.style.display = "none"; return; }
+      const res = await fetch(`${API}/playlists/${id}/music`);
+      const d = await readJson(res);
+      if (!res.ok) { alert(errText(res, d, "Could not load")); return; }
+      panel.innerHTML = `<strong>${d.in_rotation} track${d.in_rotation === 1 ? "" : "s"} in rotation</strong> (${fmtLen(d.total_seconds)} total)
+        from ${d.source === "folder" ? `folder ${esc(d.folder)}` : "the channel's audio list"}
+        <table class="history-table"><tbody>${d.tracks.map(t => `<tr style="${t.in_rotation ? "" : "color:#999;"}">
+          <td>ID ${t.id}</td><td>${esc(t.title)} ${vocalsTag(t.vocals)}</td><td>${fmtLen(t.duration)}</td>
+          <td>${t.in_rotation ? "" : t.enabled ? `skipped (${esc(t.status)})` : "disabled"}</td></tr>`).join("")
+          || `<tr><td>No tracks</td></tr>`}</tbody></table>`;
+      panel.style.display = "block";
+    }
+
+    function historyTable(rows, showChannel) {
+      if (!rows.length) return `<p style="color:#888;">Nothing played yet.</p>`;
+      return `<table class="history-table"><thead><tr><th>Started</th>${showChannel ? "<th>Channel</th>" : ""}<th>Song</th><th>Played</th><th>Result</th></tr></thead><tbody>
+        ${rows.map(h => `<tr><td>${new Date(h.started_at).toLocaleString()}</td>
+          ${showChannel ? `<td>${esc(h.channel || `#${h.playlist_id}`)}</td>` : ""}
+          <td>${esc(h.title || "")}${h.media_id ? ` <small style="color:#888;">ID ${h.media_id}</small>` : ""}</td>
+          <td>${h.played_seconds != null ? fmtLen(h.played_seconds) : ""}${h.planned_seconds ? ` / ${fmtLen(h.planned_seconds)}` : ""}</td>
+          <td class="outcome-${esc(h.outcome)}" title="${esc(h.reason || "")}">${h.outcome === "natural" ? "played to the end" : esc(h.outcome)}${h.reason ? ` <small>(${esc(h.reason)})</small>` : ""}</td></tr>`).join("")}
+        </tbody></table>`;
+    }
+
+    async function toggleHistory(id) {
+      const panel = document.getElementById(`history-panel-${id}`);
+      if (panel.style.display === "block") { panel.style.display = "none"; return; }
+      const res = await fetch(`${API}/history?playlist_id=${id}&limit=100`);
+      const d = await readJson(res);
+      panel.innerHTML = res.ok ? `<strong>Last ${d.length} plays</strong>${historyTable(d, false)}` : esc(errText(res, d, "Could not load"));
+      panel.style.display = "block";
+    }
+
+    async function loadHistory() {
+      const res = await fetch(`${API}/history?limit=100`);
+      const d = await readJson(res);
+      document.getElementById("historyList").innerHTML = res.ok ? historyTable(d, true)
+        : `<p class="error">${esc(errText(res, d, "Could not load"))}</p>`;
     }
 
     // ========== Backups ==========
@@ -1055,6 +1292,7 @@
       const state = !d.running ? "Stopped"
         : (d.ffmpeg_alive ? "On air" : "Restarting after a problem");
       const head = `Status: ${state} | restarts: ${d.restarts ?? 0}` +
+        (d.now_playing ? ` | now playing: ${d.now_playing}` : "") +
         (d.last_exit_code != null ? ` | last exit code: ${d.last_exit_code}` : "");
       pre.textContent = head + "\n\n" + (d.log.length ? d.log.join("\n") : "(no log yet)");
       pre.style.display = "block";
@@ -1122,6 +1360,7 @@
     loadMedia();
     loadPlaylists();
     loadBackups();
+    loadHistory();
   </script>
 </body>
 </html>
