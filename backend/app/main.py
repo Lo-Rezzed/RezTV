@@ -987,7 +987,8 @@ class RestoreRequest(BaseModel):
 @app.get("/backups")
 async def get_backups(username: str = Depends(verify_admin)):
     return {"backups": backup_svc.list_backups(), "settings": _backup_config(),
-            "last_error": backup_scheduler.last_error, "backup_path": backup_svc.BACKUP_PATH}
+            "last_error": backup_scheduler.last_error, "backup_path": backup_svc.BACKUP_PATH,
+            "job": backup_svc.current_job(), "busy": backup_svc.busy()}
 
 
 @app.put("/backups/settings")
@@ -1004,16 +1005,26 @@ async def update_backup_settings(data: BackupSettingsUpdate, db: Session = Depen
     return _backup_config()
 
 
-@app.post("/backups")
+@app.post("/backups", status_code=202)
 def backup_now(data: BackupRequest | None = None, username: str = Depends(verify_admin)):
-    # Plain def: FastAPI runs it in a worker thread, so a long backup does not block streams/API.
+    """Starts the backup in the background and returns the job at once; poll
+    GET /backups/jobs/{id} for progress and the result. A backup with media can
+    run far longer than a proxy's read timeout, so the request never waits for it."""
     data = data or BackupRequest()
     try:
-        return backup_svc.create_backup(engine, Base.metadata, MEDIA_PATH,
-                                        include_media=data.include_media)
-    except OSError as e:
-        log.exception("Backup failed")
-        raise HTTPException(status_code=500, detail=f"Backup failed: {e}")
+        job = backup_svc.start_backup_job(engine, Base.metadata, MEDIA_PATH,
+                                          include_media=data.include_media)
+    except backup_svc.BusyError as e:
+        raise HTTPException(status_code=409, detail=f"{e}. Wait for it to finish and try again.")
+    return {"job": job}
+
+
+@app.get("/backups/jobs/{job_id}")
+async def backup_job_status(job_id: str, username: str = Depends(verify_admin)):
+    job = backup_svc.current_job()
+    if not job or job["id"] != job_id:
+        raise HTTPException(status_code=404, detail="Backup job not found (the server may have restarted)")
+    return job
 
 
 @app.get("/backups/{name}/download")
@@ -1044,6 +1055,9 @@ def restore_backup(data: RestoreRequest, username: str = Depends(verify_admin)):
         backup_svc.resolve(data.name)
     except (ValueError, FileNotFoundError):
         raise HTTPException(status_code=404, detail="Backup not found")
+    if backup_svc.busy():
+        raise HTTPException(status_code=409, detail="A backup or restore is already running. "
+                            "Wait for it to finish and try again.")
     # Safety net: save the current database first (small, no media).
     safety = backup_svc.create_backup(engine, Base.metadata, MEDIA_PATH,
                                       include_media=False, label="pre-restore")

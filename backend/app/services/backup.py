@@ -12,6 +12,7 @@ import re
 import tarfile
 import threading
 import time
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 
@@ -79,8 +80,22 @@ def load_database(engine, metadata, data: dict):
                         f"COALESCE((SELECT MAX(id) FROM {t.name}), 0) + 1, false)"))
 
 
+def _media_totals(media_path: str) -> tuple[int, int]:
+    files = size = 0
+    for root, _dirs, names in os.walk(media_path):
+        for n in names:
+            try:
+                size += os.path.getsize(os.path.join(root, n))
+                files += 1
+            except OSError:
+                pass
+    return files, size
+
+
 def create_backup(engine, metadata, media_path: str, include_media: bool = True,
-                  label: str = "") -> dict:
+                  label: str = "", progress=None) -> dict:
+    """`progress`, if given, is called as progress(files_done, files_total,
+    bytes_done, bytes_total) while media files are added."""
     with _lock:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         suffix = f"-{label}" if label else ""
@@ -97,13 +112,83 @@ def create_backup(engine, metadata, media_path: str, include_media: bool = True,
                 info.size, info.mtime = len(payload), int(time.time())
                 tar.addfile(info, io.BytesIO(payload))
                 if include_media and os.path.isdir(media_path):
-                    tar.add(media_path, arcname="media")
+                    if progress is None:
+                        tar.add(media_path, arcname="media")
+                    else:
+                        files_total, bytes_total = _media_totals(media_path)
+                        done = {"files": 0, "bytes": 0}
+
+                        def count(ti):
+                            if ti.isfile():
+                                done["files"] += 1
+                                done["bytes"] += ti.size
+                                progress(done["files"], files_total, done["bytes"], bytes_total)
+                            return ti
+                        progress(0, files_total, 0, bytes_total)
+                        tar.add(media_path, arcname="media", filter=count)
             os.replace(tmp, final)
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise
         log.info("Backup written: %s", final.name)
         return describe(final)
+
+
+class BusyError(RuntimeError):
+    """A backup or restore is already running."""
+
+
+def busy() -> bool:
+    return _lock.locked() or (_job is not None and _job["state"] == "running")
+
+
+# Manual "Back up now" runs in the background so the request returns at once
+# (a backup with media can take longer than nginx's proxy_read_timeout).
+# Only the latest job is remembered; it lives in memory until the next one.
+_job: dict | None = None
+_job_lock = threading.Lock()
+
+
+def current_job() -> dict | None:
+    with _job_lock:
+        return dict(_job) if _job else None
+
+
+def start_backup_job(engine, metadata, media_path: str, include_media: bool = True,
+                     label: str = "") -> dict:
+    """Start a backup in a background thread and return its job record.
+    Raises BusyError if a backup or restore is already running."""
+    global _job
+    with _job_lock:
+        if busy():
+            raise BusyError("A backup or restore is already running")
+        job = {"id": uuid.uuid4().hex, "state": "running", "include_media": include_media,
+               "started": datetime.now().isoformat(timespec="seconds"), "finished": None,
+               "files_done": 0, "files_total": None, "bytes_done": 0, "bytes_total": None,
+               "name": None, "size": None, "error": None}
+        _job = job
+
+    def update(**fields):
+        with _job_lock:
+            job.update(fields)
+
+    def progress(files_done, files_total, bytes_done, bytes_total):
+        update(files_done=files_done, files_total=files_total,
+               bytes_done=bytes_done, bytes_total=bytes_total)
+
+    def run():
+        try:
+            result = create_backup(engine, metadata, media_path, include_media=include_media,
+                                   label=label, progress=progress)
+            update(state="done", name=result["name"], size=result["size"])
+        except Exception as e:  # reported to the admin page via the job record
+            log.exception("Background backup failed")
+            update(state="error", error=str(e) or e.__class__.__name__)
+        finally:
+            update(finished=datetime.now().isoformat(timespec="seconds"))
+
+    threading.Thread(target=run, daemon=True, name=f"backup-{job['id'][:8]}").start()
+    return current_job()
 
 
 def describe(path: Path) -> dict:

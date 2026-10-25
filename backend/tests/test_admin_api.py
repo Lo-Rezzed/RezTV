@@ -172,3 +172,61 @@ def test_download_backup_path_safety(client, tmp_path, bad):
     (tmp_path / "outside.tar.gz").write_text("nope")
     r = client.get(f"/backups/{bad}/download", headers=AUTH)
     assert r.status_code == 404
+
+
+# ---------- background "Back up now" ----------
+
+def _wait(client, job_id, timeout=20):
+    import time
+    end = time.time() + timeout
+    while time.time() < end:
+        j = client.get(f"/backups/jobs/{job_id}", headers=AUTH).json()
+        if j["state"] != "running":
+            return j
+        time.sleep(0.05)
+    raise AssertionError("backup job did not finish")
+
+
+@pytest.fixture
+def clean_job(monkeypatch):
+    monkeypatch.setattr(backup, "_job", None)
+    yield
+
+
+def test_backup_now_runs_in_background(client, clean_job):
+    (open(os.path.join(main.MEDIA_PATH, "a.mp4"), "wb")).write(b"clip" * 1000)
+    r = client.post("/backups", json={"include_media": True}, headers=AUTH)
+    assert r.status_code == 202
+    job = r.json()["job"]
+    assert job["state"] in ("running", "done") and job["id"]
+    done = _wait(client, job["id"])
+    assert done["state"] == "done" and done["error"] is None
+    assert done["files_done"] == done["files_total"] == 1 and done["bytes_done"] == 4000
+    assert (backup.backup_dir() / done["name"]).is_file()
+    listing = client.get("/backups", headers=AUTH).json()
+    assert listing["job"]["name"] == done["name"] and listing["busy"] is False
+    assert done["name"] in [b["name"] for b in listing["backups"]]
+
+
+def test_backup_now_reports_errors(client, clean_job, monkeypatch):
+    def boom(*a, **k):
+        raise OSError("No space left on device")
+    monkeypatch.setattr(backup, "create_backup", boom)
+    job = client.post("/backups", json={"include_media": False}, headers=AUTH).json()["job"]
+    done = _wait(client, job["id"])
+    assert done["state"] == "error" and "No space left" in done["error"]
+
+
+def test_backup_now_409_when_busy(client, clean_job):
+    with backup._lock:  # a scheduled backup or a restore holds the lock
+        r = client.post("/backups", json={"include_media": False}, headers=AUTH)
+        assert r.status_code == 409 and "already running" in r.json()["detail"]
+        name, _ = _backup_file()
+        r = client.post("/backups/restore", json={"name": name, "confirm": name}, headers=AUTH)
+        assert r.status_code == 409
+
+
+def test_backup_job_status_auth_and_unknown(client, clean_job):
+    assert client.get("/backups/jobs/abc").status_code == 401
+    assert client.get("/backups/jobs/abc", headers=AUTH).status_code == 404
+    assert client.post("/backups", json={}).status_code == 401

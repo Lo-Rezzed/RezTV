@@ -110,3 +110,15 @@ def test_scheduler_and_prune(tmp_path, monkeypatch):
     assert len([b for b in backup.list_backups() if b["scheduled"]]) == 2  # pruned to keep
     cfg["interval_hours"] = 0
     assert s.tick(now=time.time() + 99999) is False
+
+
+def test_backup_progress_callback(tmp_path, monkeypatch):
+    monkeypatch.setattr(backup, "BACKUP_PATH", str(tmp_path / "b"))
+    eng, md, _ = _db(tmp_path)
+    media = tmp_path / "media"
+    (media / "F").mkdir(parents=True)
+    for i in range(3):
+        (media / "F" / f"{i}.mp4").write_bytes(b"x" * 10)
+    calls = []
+    backup.create_backup(eng, md, str(media), progress=lambda *a: calls.append(a))
+    assert calls[0] == (0, 3, 0, 30) and calls[-1] == (3, 3, 30, 30)
