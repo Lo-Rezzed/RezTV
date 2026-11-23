@@ -38,15 +38,15 @@ RezTV reads its passwords from a `.env` file that you create. It is never commit
 
 ```bash
 cp .env.example .env
-openssl rand -hex 24   # run twice, once for each password
-nano .env              # paste in your own ADMIN_PASSWORD and POSTGRES_PASSWORD
+openssl rand -hex 24   # run three times: ADMIN_PASSWORD, POSTGRES_PASSWORD, SESSION_SECRET
+nano .env              # paste in ADMIN_PASSWORD, POSTGRES_PASSWORD and SESSION_SECRET
 ```
 
-`docker compose` will refuse to start if either password is missing. Use a unique, long password; anyone with the admin password can upload, delete and stream on your station.
+`docker compose` will refuse to start if either password or `SESSION_SECRET` is missing. Use a unique, long password; anyone with the admin password can upload, delete and stream on your station.
 
 > If you change `POSTGRES_PASSWORD` after the database was first created, the existing database keeps the old one. For a fresh install, remove the old volume first: `docker compose down -v` (this deletes all channel and media records).
 
-RezTV only listens on the server itself (`127.0.0.1:8000`), so it is not reachable from the internet until you set up nginx. Follow [Domain & SSL](docs/domain-ssl.md) to put it on your domain with HTTPS, then open `https://yourdomain.com/admin`. To test before nginx is set up, use an SSH tunnel from your own computer: `ssh -L 8000:localhost:8000 root@your-server-ip`, then open `http://localhost:8000/admin`. Log in with the username and password from your `.env`.
+RezTV only listens on the server itself (`127.0.0.1:8000`), so it is not reachable from the internet until you set up nginx. Follow [Domain & SSL](docs/domain-ssl.md) to put it on your domain with HTTPS, then open `https://yourdomain.com/admin` (you will be sent to a login page). To test before nginx is set up, use an SSH tunnel from your own computer: `ssh -L 8000:localhost:8000 root@your-server-ip`, then open `http://localhost:8000/admin`. Log in with the username and password from your `.env`; a signed cookie keeps you signed in for 30 days.
 
 ## Documentation
 

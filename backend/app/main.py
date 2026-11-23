@@ -22,7 +22,10 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("reztv")
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from urllib.parse import quote
+import html as html_lib
 from app.core.database import engine, Base, get_db
 from app.models.media import Media
 from app.models.playlist import Playlist
@@ -353,12 +356,20 @@ def clean_folder_name(name: str | None) -> str:
     return name or DEFAULT_FOLDER
 
 app = FastAPI(title="RezTV", version="0.1.0", lifespan=lifespan)
-security = HTTPBasic()
+# auto_error=False: missing Basic must not send WWW-Authenticate, which triggers the browser popup.
+security = HTTPBasic(auto_error=False)
 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 if not ADMIN_PASSWORD:
     raise RuntimeError("ADMIN_PASSWORD is not set. Put it in your .env file before starting RezTV.")
+
+SESSION_SECRET = os.getenv("SESSION_SECRET")
+if not SESSION_SECRET:
+    raise RuntimeError("SESSION_SECRET is not set. Put it in your .env file before starting RezTV.")
+SESSION_COOKIE = "reztv_session"
+SESSION_MAX_AGE = 30 * 24 * 60 * 60  # 30 days
+_session_signer = URLSafeTimedSerializer(SESSION_SECRET, salt="reztv-admin-session")
 
 # Simple login rate limiting: too many failed logins from one IP locks it out for a while.
 LOGIN_MAX_FAILURES = int(os.getenv("LOGIN_MAX_FAILURES", "5"))
@@ -372,29 +383,113 @@ def _client_ip(request: Request) -> str:
     fwd = request.headers.get("x-real-ip") or request.headers.get("x-forwarded-for", "").split(",")[0].strip()
     return fwd or (request.client.host if request.client else "unknown")
 
-def verify_admin(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
-    ip = _client_ip(request)
+def _lockout_status(ip: str) -> tuple[bool, int]:
+    """Return (is_locked, retry_after_seconds). Drops failures outside the window."""
     now = time.monotonic()
     with _failed_lock:
         q = _failed_logins[ip]
         while q and now - q[0] > LOGIN_WINDOW_SECONDS:
             q.popleft()
         if len(q) >= LOGIN_MAX_FAILURES:
-            raise HTTPException(status_code=429, detail="Too many failed logins. Try again later.",
-                                headers={"Retry-After": str(int(LOGIN_WINDOW_SECONDS - (now - q[0])) + 1)})
-    correct_username = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
-    correct_password = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
-    if not (correct_username and correct_password):
-        with _failed_lock:
-            _failed_logins[ip].append(now)
+            return True, int(LOGIN_WINDOW_SECONDS - (now - q[0])) + 1
+    return False, 0
+
+def _record_failed_login(ip: str) -> None:
+    with _failed_lock:
+        _failed_logins[ip].append(time.monotonic())
+
+def _clear_failed_logins(ip: str) -> None:
+    with _failed_lock:
+        _failed_logins.pop(ip, None)
+
+def _raise_if_locked(ip: str) -> None:
+    locked, retry_after = _lockout_status(ip)
+    if locked:
+        raise HTTPException(status_code=429, detail="Too many failed logins. Try again later.",
+                            headers={"Retry-After": str(retry_after)})
+
+def _check_password(username: str, password: str) -> bool:
+    # compare_digest is constant-time; both sides must be strings of any length.
+    ok_user = secrets.compare_digest(username, ADMIN_USERNAME)
+    ok_pass = secrets.compare_digest(password, ADMIN_PASSWORD)
+    return ok_user and ok_pass
+
+def _issue_session_token(username: str) -> str:
+    return _session_signer.dumps({"u": username})
+
+def _user_from_session_cookie(request: Request) -> str | None:
+    token = request.cookies.get(SESSION_COOKIE)
+    if not token:
+        return None
+    try:
+        data = _session_signer.loads(token, max_age=SESSION_MAX_AGE)
+    except (BadSignature, SignatureExpired, Exception):
+        return None
+    if not isinstance(data, dict):
+        return None
+    username = data.get("u")
+    if not isinstance(username, str) or not secrets.compare_digest(username, ADMIN_USERNAME):
+        return None
+    return username
+
+def _set_session_cookie(response: Response, username: str) -> None:
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=_issue_session_token(username),
+        max_age=SESSION_MAX_AGE,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
+
+def _clear_session_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key=SESSION_COOKIE,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
+
+def _safe_next(next_url: str | None) -> str:
+    """Only allow same-origin relative paths, to prevent open redirects."""
+    if not next_url:
+        return "/admin"
+    next_url = next_url.strip()
+    if (next_url.startswith("/") and not next_url.startswith("//")
+            and "\\" not in next_url and ":" not in next_url
+            and "\n" not in next_url and "\r" not in next_url):
+        return next_url
+    return "/admin"
+
+def verify_admin(request: Request, credentials: HTTPBasicCredentials | None = Depends(security)):
+    """Accept a valid session cookie or HTTP Basic credentials.
+
+    Missing auth on API routes returns 401 without WWW-Authenticate, so browsers
+    never show the Basic-auth popup. The /admin HTML page redirects to /login instead.
+    """
+    ip = _client_ip(request)
+    _raise_if_locked(ip)
+
+    user = _user_from_session_cookie(request)
+    if user:
+        return user
+
+    if credentials is not None:
+        if _check_password(credentials.username, credentials.password):
+            _clear_failed_logins(ip)
+            return credentials.username
+        _record_failed_login(ip)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Basic"},
         )
-    with _failed_lock:
-        _failed_logins.pop(ip, None)
-    return credentials.username
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Not authenticated",
+    )
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
@@ -578,9 +673,80 @@ async def root():
 async def health():
     return {"status": "ok"}
 
+def _login_page(error: str | None = None, next_url: str = "/admin", retry_after: int | None = None) -> HTMLResponse:
+    path = os.path.join(os.path.dirname(__file__), "static", "login.html")
+    with open(path, encoding="utf-8") as fh:
+        html = fh.read()
+    if error:
+        msg = error
+        if retry_after is not None:
+            minutes = max(1, (retry_after + 59) // 60)
+            msg = f"{error} Try again in about {minutes} minute{'s' if minutes != 1 else ''}."
+        banner = f'<p class="error">{msg}</p>'
+    else:
+        banner = ""
+    html = html.replace("<!--ERROR-->", banner)
+    html = html.replace("{{NEXT}}", html_lib.escape(next_url, quote=True))
+    status_code = 429 if retry_after is not None else 200
+    headers = {"Retry-After": str(retry_after)} if retry_after is not None else None
+    return HTMLResponse(html, status_code=status_code, headers=headers)
+
+@app.get("/login")
+async def login_page(request: Request, next: str = "/admin"):
+    next_url = _safe_next(next)
+    if _user_from_session_cookie(request):
+        return RedirectResponse(next_url, status_code=303)
+    ip = _client_ip(request)
+    locked, retry_after = _lockout_status(ip)
+    if locked:
+        return _login_page("Too many failed logins.", next_url, retry_after)
+    return _login_page(None, next_url)
+
+@app.post("/login")
+async def login_submit(request: Request, username: str = Form(""), password: str = Form(""),
+                       next: str = Form("/admin")):
+    next_url = _safe_next(next)
+    ip = _client_ip(request)
+    locked, retry_after = _lockout_status(ip)
+    if locked:
+        return _login_page("Too many failed logins.", next_url, retry_after)
+    if _check_password(username, password):
+        _clear_failed_logins(ip)
+        response = RedirectResponse(next_url, status_code=303)
+        _set_session_cookie(response, ADMIN_USERNAME)
+        return response
+    _record_failed_login(ip)
+    locked, retry_after = _lockout_status(ip)
+    if locked:
+        return _login_page("Too many failed logins.", next_url, retry_after)
+    return _login_page("Incorrect username or password.", next_url)
+
+@app.api_route("/logout", methods=["GET", "POST"])
+async def logout():
+    response = RedirectResponse("/login", status_code=303)
+    _clear_session_cookie(response)
+    return response
+
 @app.get("/admin")
-async def admin_page(username: str = Depends(verify_admin)):
-    return FileResponse("app/static/index.html")
+async def admin_page(request: Request, credentials: HTTPBasicCredentials | None = Depends(security)):
+    # Redirect browsers to the login form instead of a 401 (which could prompt a popup).
+    # Basic still works here so a script can fetch the page if it needs to.
+    ip = _client_ip(request)
+    locked, retry_after = _lockout_status(ip)
+    if locked:
+        raise HTTPException(status_code=429, detail="Too many failed logins. Try again later.",
+                            headers={"Retry-After": str(retry_after)})
+    if _user_from_session_cookie(request):
+        return FileResponse("app/static/index.html")
+    if credentials is not None:
+        if _check_password(credentials.username, credentials.password):
+            _clear_failed_logins(ip)
+            return FileResponse("app/static/index.html")
+        _record_failed_login(ip)
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Incorrect username or password")
+    next_url = quote(_safe_next(request.url.path), safe="/")
+    return RedirectResponse(f"/login?next={next_url}", status_code=303)
 
 @app.post("/upload")
 async def upload_video(

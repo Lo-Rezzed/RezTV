@@ -44,11 +44,11 @@ RezTV reads its passwords from a `.env` file that you create. It is never commit
 
 ```bash
 cp .env.example .env
-openssl rand -hex 24   # run twice, once for each password
-nano .env              # paste in your own ADMIN_PASSWORD and POSTGRES_PASSWORD
+openssl rand -hex 24   # run three times: ADMIN_PASSWORD, POSTGRES_PASSWORD, SESSION_SECRET
+nano .env              # paste in ADMIN_PASSWORD, POSTGRES_PASSWORD and SESSION_SECRET
 ```
 
-`docker compose` will refuse to start if either password is missing. Use a unique, long password; anyone with the admin password can upload, delete and stream on your station.
+`docker compose` will refuse to start if either password or `SESSION_SECRET` is missing. Use a unique, long password; anyone with the admin password can upload, delete and stream on your station.
 
 > If you change `POSTGRES_PASSWORD` after the database was first created, the existing database keeps the old one. For a fresh install, remove the old volume first: `docker compose down -v` (this deletes all channel and media records).
 
@@ -59,12 +59,13 @@ docker compose up -d --build
 docker compose ps        # both reztv-db and reztv-backend should be "running"
 ```
 
-RezTV only listens on the server itself (`127.0.0.1:8000`), so it is not reachable from the internet until you set up nginx. Follow [Domain & SSL](domain-ssl.md) to put it on your domain with HTTPS, then open `https://yourdomain.com/admin`. To test before nginx is set up, use an SSH tunnel from your own computer: `ssh -L 8000:localhost:8000 root@your-server-ip`, then open `http://localhost:8000/admin`.
+RezTV only listens on the server itself (`127.0.0.1:8000`), so it is not reachable from the internet until you set up nginx. Follow [Domain & SSL](domain-ssl.md) to put it on your domain with HTTPS, then open `https://yourdomain.com/admin` (you will be sent to a login page). To test before nginx is set up, use an SSH tunnel from your own computer: `ssh -L 8000:localhost:8000 root@your-server-ip`, then open `http://localhost:8000/admin`.
 
 ## Security settings
 
-- RezTV will not start if `ADMIN_PASSWORD` is missing (there is no default password).
-- After 5 wrong logins from one address within 15 minutes, that address is locked out for 15 minutes. Change with `LOGIN_MAX_FAILURES` and `LOGIN_WINDOW_SECONDS` in `.env`.
+- RezTV will not start if `ADMIN_PASSWORD` or `SESSION_SECRET` is missing (there is no default password).
+- After 5 wrong logins from one address within 15 minutes, that address is locked out for 15 minutes. This applies to the login form and to HTTP Basic (used by upload scripts). Change with `LOGIN_MAX_FAILURES` and `LOGIN_WINDOW_SECONDS` in `.env`.
+- The admin login page sets a signed, HttpOnly, Secure cookie that lasts 30 days. Open `/logout` to end the session.
 - Uploads: MP4, MOV, MKV, WebM and animated GIF only, up to 2 GB by default. Change the limit with `MAX_UPLOAD_MB` in `.env` (and `client_max_body_size` in nginx to match). Every upload is checked with ffprobe and rejected if it isn't a readable video.
 - The media library list is only visible to the admin and never shows server file paths.
 

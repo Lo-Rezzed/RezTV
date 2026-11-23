@@ -2,9 +2,9 @@
 
 ## First Login
 
-1. Open your admin panel: `https://yourdomain.com/admin`
-2. You will be asked for a username and password (the `ADMIN_USERNAME` and `ADMIN_PASSWORD` you set in your `.env` file)
-3. After logging in you will see the admin dashboard
+1. Open your admin panel: `https://yourdomain.com/admin` (or go straight to `https://yourdomain.com/login`)
+2. Enter the username and password from your `.env` file (`ADMIN_USERNAME` and `ADMIN_PASSWORD`). You can paste the password or use a password manager.
+3. After logging in you will see the admin dashboard. You stay signed in for 30 days; use **Log out** when you want to end the session.
 
 ## Setting Your Station Name
 

@@ -12,3 +12,6 @@ postgres_data/
 __pycache__/
 .pytest_cache/
 backups/
+
+# Local rollback copies (may include .env backups)
+*.bak-login-*

@@ -82,7 +82,7 @@ Certbot configures HTTPS and sets up automatic renewal.
 Visit:
 
 - `https://yourdomain.com`
-- `https://yourdomain.com/admin` (asks for the username and password from your `.env`)
+- `https://yourdomain.com/admin` (redirects to the login page; use the username and password from your `.env`)
 - `https://yourdomain.com/channel/1`
 
 You should see a secure padlock in the browser.
