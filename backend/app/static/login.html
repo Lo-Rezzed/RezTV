@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RezTV - Admin Login</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 1100px; margin: 40px auto; padding: 20px; background: #f5f5f5; }
+    h1 { margin-bottom: 5px; }
+    section { background: white; margin-bottom: 30px; padding: 20px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); max-width: 420px; }
+    label { display: block; margin: 12px 0 4px; font-weight: bold; }
+    input[type=text], input[type=password] { padding: 8px; margin: 0; width: 100%; box-sizing: border-box; }
+    button { padding: 8px 16px; margin: 16px 0 0; cursor: pointer; border-radius: 5px; border: 1px solid #bbb; background: #eee; }
+    button:hover { background: #ddd; }
+    .error { color: crimson; margin: 0 0 12px; }
+    .hint { color: #888; font-size: 0.9rem; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <h1>RezTV Admin</h1>
+  <section>
+    <h2>Log in</h2>
+    <!--ERROR-->
+    <form method="post" action="/login" autocomplete="on">
+      <input type="hidden" name="next" value="{{NEXT}}">
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username" autocomplete="username" required autofocus>
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" autocomplete="current-password" required>
+      <button type="submit">Log in</button>
+    </form>
+    <p class="hint">This session stays signed in for 30 days. You can paste your password or use a password manager.</p>
+  </section>
+</body>
+</html>
